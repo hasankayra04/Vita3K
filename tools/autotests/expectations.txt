@@ -21,41 +21,41 @@ callback                        pass
 callback_after_wake             skip     # threads ignore their core and priority, so whether the woken thread ran before the notify is a race
 callback_after_wake_more        fail     # threads ignore their core and priority, so T runs on after the wake, its callback runs at the check or never, and the notify fails once T deleted it
 callback_cancel_departed        skip     # threads ignore their core and priority, so whether a notified callback runs before the cancel or delete is a race
-callback_cancel_flag            fail     # a cancel or delete of a pending callback clears the flag, the Vita keeps it
+callback_cancel_flag            pass
 callback_cancel_sets_waited_bits pass
 callback_changes                pass
 callback_clobbers_registers     pass
-callback_create_check_order     fail     # a callback create checks the attribute before the name, so a long name with attribute 0x80 gives 0x8002000E, not 0x80024002
-callback_delete_in_run          fail     # a self delete in a callback check gives 0x800280A1 where the Vita gives 0
-callback_deleted_nested_wait_notify fail     # a callback deleted during its run is gone at once, so a notify of it gives 0x800280A1
+callback_create_check_order     fail     # a callback create takes a function at a data address, the Vita refuses one that isn't executable
+callback_delete_in_run          pass
+callback_deleted_nested_wait_notify skip     # a notified waiter leaves the queue only when its thread runs, so whether the object still counts it right after the notify is a race
 callback_deleted_object         pass
 callback_edges                  pass
-callback_entry_state            fail     # a Thumb callback run by a check starts with the wrong r4 to r9 values
-callback_errors                 crash    # callback NULL argument errors, a NULL name
+callback_entry_state            fail     # a callback run by a CB wait starts on the caller's sp, the Vita's libkernel wrapper puts it 8 bytes below
+callback_errors                 pass
 callback_event_results          fail     # event calls don't take message pipe UIDs
 callback_event_waits            pass
-callback_exit_call              fail     # _sceKernelExitCallback is unimplemented, so it returns to the callback, which is kept whatever the value
+callback_exit_call              pass
 callback_exit_check             fail     # an exit inside a callback doesn't end the app
 callback_exit_delay             fail     # an exit inside a callback doesn't end the app
 callback_exit_delete_check      fail     # an exit inside a callback doesn't end the app
 callback_exit_delete_delay      fail     # an exit inside a callback doesn't end the app
 callback_function_memory        fail     # a callback create takes a function in a USER_RW block or on the stack
 callback_info                   pass
-callback_info_fields            fail     # the notify ID of a callback is -1 and 0 swapped, fresh and inside a run
-callback_info_size_order        fail     # the callback info call looks the UID up before it checks the size
+callback_info_fields            fail     # callbacks registered to simple events aren't notified by its sets
+callback_info_size_order        pass
 callback_inner_nonobject_waits  pass
 callback_inner_same_object      pass
 callback_inner_same_pipe        pass
 callback_inner_wait             pass
 callback_limit                  fail     # no callback limit, Vita3K makes 4096 where the Vita stops at 2027 with an error
-callback_names                  fail     # a callback with a function at 0x1000 is created, the Vita refuses it
-callback_nesting                fail     # callbacks don't run inside callbacks
-callback_nesting_depth          fail     # callbacks don't run inside callbacks
+callback_names                  pass
+callback_nesting                pass
+callback_nesting_depth          pass
 callback_notify_burst           fail     # a callback notified many times before it runs counts fewer notifies
 callback_notify_cross_core      fail     # threads ignore their core and priority, so a notified thread above the spinner doesn't stop it
 callback_notify_departure_more  pass
 callback_notify_departure_state skip     # threads ignore their core and priority, so whether the notified waiter already ran when the main thread looks is a race
-callback_notify_during_run      fail     # a callback's notify ID reads -1 before the notifies, the Vita reads 0
+callback_notify_during_run      pass
 callback_notify_equal_priority  skip     # threads ignore their core and priority, so whether a notify switches to the waiter is a race
 callback_notify_id_mixed        fail     # callbacks registered to simple events aren't notified by its sets
 callback_notify_preempt         skip     # threads ignore their core and priority, so whether the callback runs inside the notify is a race
@@ -78,9 +78,9 @@ callback_retake                 pass
 callback_retake_more            pass
 callback_return_in_waits        pass
 callback_return_pass            pass
-callback_stack                  fail     # callbacks don't run inside callbacks
-callback_vfp_nested             fail     # callbacks don't run inside callbacks
-callback_vfp_return             fail     # a callback run gives the caller all 32 d registers back, the Vita keeps only d8 to d15 and leaves the callback's d2 and d3
+callback_stack                  pass
+callback_vfp_nested             pass
+callback_vfp_return             pass
 callback_wait_requeue           pass
 cancel_calls                    pass
 cancel_calls_more               fail     # sceKernelWaitMultipleEvents
@@ -104,6 +104,7 @@ cb_wait_zero_timeout_notify_more fail     # a signal or thread end wait with cal
 cb_waits                        fail     # sceKernelWaitMultipleEvents
 ceiling_base_change             fail     # a mutex ceiling doesn't raise its owner's priority
 ceiling_cancel_drops_boost      fail     # a ceiling mutex doesn't raise its owner's priority
+ceiling_cancel_requeue_waiter   fail     # a ceiling mutex doesn't raise its owner's priority
 ceiling_change_running_thread   fail     # a mutex ceiling doesn't raise its owner's priority, and a priority change below one applies at once
 ceiling_cond_relock_priority    fail     # a ceiling mutex doesn't raise its owner's priority
 ceiling_create_check_order      fail     # a mutex create checks the count before the option struct
@@ -536,7 +537,7 @@ rwlock_wake_counts              fail     # woken threads aren't READY before the
 rwlock_wake_order               pass
 savedata_slot_id                fail     # save data slot ID range checks
 self_lower_order                fail     # a thread that lowers itself doesn't go to the head of its new priority
-self_mask_change_busy_target    timeout  # threads ignore their core, so a self affinity change onto a busy core returns at once, and the test runs past the timeout
+self_mask_change_busy_target    fail     # threads ignore their core, so a self affinity change onto a busy core returns at once
 self_mask_change_yield          fail     # a self affinity change to a new mask doesn't yield to the other thread
 self_priority_drop              fail     # threads ignore their core and priority
 sema_call_error_order           fail     # semaphore calls on a mutex UID give other errors than the Vita's 0x8002000F
@@ -550,7 +551,7 @@ sema_signal_serve_order         pass
 sema_take_past_waiters          pass
 sema_waits                      pass
 semaphore                       pass
-shader_patcher_callback         fail     # a library callback's caller gets its FPSCR and TPIDRURW back after it
+shader_patcher_callback         pass
 shared_mask_change_place        fail     # the current CPU of thread info is always 0, and threads ignore their core, so A and B run before the gate ends
 shared_queue_mask_skip          fail     # threads ignore their core and priority, so R1 and R2 run at once in host order and are DORMANT before the first release
 shared_raise_cores              fail     # threads are never READY and ignore their core
@@ -659,11 +660,13 @@ thread_event_handler_mixed_order fail     # only the last registered handler of 
 thread_event_handler_null_name  fail     # a NULL thread event handler name is accepted
 thread_event_handler_process_exit pass
 thread_event_handler_register_before_run pass
+thread_event_handler_release_unregister_running fail     # thread event handlers are global and an unregister always returns 0
 thread_event_handler_shared_release fail     # thread event handlers are global and registering one returns 0, not a UID, and an unregister inside a handler isn't refused
 thread_event_handler_stack      fail     # event handler sp is 0x28 below the stack top and 16 aligned, the Vita's is 0x30
 thread_event_handler_start_sp   fail     # an END handler starts on the entry's stack pointer, the Vita starts it below it
 thread_event_handler_start_target fail     # a start of a thread that runs its own thread event handler isn't refused
 thread_event_handler_unregister_in_entry fail     # an unregister from the thread's own entry doesn't stop its END run
+thread_event_handler_unregister_other_uids fail     # an unregister always returns 0, whatever the UID
 thread_event_handler_vfp        pass
 thread_exit_status              fail     # an end wait for an ended thread writes back part of its timeout
 thread_for_vm_errors            pass
@@ -746,7 +749,7 @@ timer_open_close_bits           fail     # a timer's open and close don't set it
 timer_period                    skip     # timing, how evenly a repeating timer fires
 timer_remaining_passed          pass
 timer_repeat_argument_values    pass
-timer_repeat_auto_reset_missed  pass
+timer_repeat_auto_reset_missed  skip     # whether the second poll sees the next fire depends on how busy the host is between the polls
 timer_repeat_info_steps         pass
 timer_repeat_pulse_vs_set       pass
 timer_requeue                   fail     # no requeue on a priority change

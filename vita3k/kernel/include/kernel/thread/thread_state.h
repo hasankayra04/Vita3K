@@ -18,7 +18,8 @@
 #pragma once
 
 #include <cpu/common.h>
-#include <kernel/thread/wait_queue.h>
+#include <kernel/callback.h>
+#include <kernel/sync_primitive.h>
 #include <kernel/types.h>
 #include <mem/block.h>
 #include <mem/ptr.h>
@@ -26,7 +27,6 @@
 #include <algorithm>
 #include <condition_variable>
 #include <initializer_list>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -47,13 +47,14 @@ enum class ThreadStatus : SceUInt32 {
     suspended = SCE_KERNEL_THREAD_STATUS_SUSPENDED, // Held by a ForVM suspend, only reported
 };
 
-struct ThreadState final {
+// A thread, which its end waiters wait on like on any waitable object. Lock order: the object's lock,
+// which guards the end waiters, then thread_mutex, then the thread_mutex of an end waiter it wakes.
+struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> {
     // Fixed when the thread is created
     const SceUID id;
-    const std::string name;
     const Address entry_point;
     // What thread info reports, the creation attributes and SCE_KERNEL_THREAD_ATTR_USER
-    const SceUInt32 attr;
+    const SceUInt32 thread_attr;
     // The stack size, a whole number of pages
     const int stack_size;
     const Block stack;
@@ -83,9 +84,9 @@ struct ThreadState final {
     // ends it, until it's deleted
     void run_loop();
     // Calls a guest function on the thread's CPU from inside a kernel call, usually one the thread
-    // itself made, and returns its r0, or the exit status if the thread ends during it. With
-    // fresh_vfp_state, the call starts with the FPSCR and VFP exception setting of a new thread.
-    uint32_t call_guest(Address fn, std::initializer_list<uint32_t> args, bool fresh_vfp_state = false);
+    // itself made, like a function pointer call from library code. The registers are then the ones
+    // the function leaves. Returns its r0, or the exit status if the thread ends during it.
+    uint32_t call_guest(Address fn, std::initializer_list<uint32_t> args);
     // Starts the dormant thread from another thread and returns its exit status once it ends. Used
     // for module start and stop and the GXM display queue.
     uint32_t start_and_wait(SceSize args, const Ptr<void> argp = Ptr<void>{});
@@ -143,17 +144,20 @@ struct ThreadState final {
     // display wait ended on, and at least next_vblank. The next display wait counts from it.
     uint64_t next_display_wait(uint64_t next_vblank, int vcount);
 
-    // Callbacks
+    // Callbacks this thread created
+    // Notifies cb directly with arg and wakes a wait with callbacks
+    void notify_callback(Callback &cb, SceInt32 arg);
+    // Drops cb's pending notifications
+    void cancel_callback(Callback &cb);
+    // cb's pending notifications
+    Callback::Notification callback_notifications(const Callback &cb);
+    // Deletes cb for deleter, or returns false if it was deleted already. A run of it going on keeps
+    // its UID until the run ends.
+    bool delete_callback(Callback &cb, SceUID deleter);
     // Runs the notified callbacks of this thread and returns how many ran. Called by the thread itself.
     SceUInt32 process_callbacks();
-    // Returns whether a notified callback would run now, which none does inside a callback. Takes mutex.
+    // Returns whether a callback of this thread was notified since its last callback pass
     bool has_pending_callbacks();
-    // Adds a callback this thread created. Called by the thread itself.
-    void add_callback(const CallbackPtr &cb) { callbacks.push_back(cb); }
-    // Counts a callback of this thread that was notified and hasn't run for it yet, waking a wait
-    // with callbacks, and stops counting it. Called by the callback with its lock held.
-    void add_notified_callback();
-    void remove_notified_callback();
 
     // Holds: the debugger, the emulator pause and the ForVM suspend
     // Stops the thread for the debugger the next time it would run guest code, or lets it run again.
@@ -177,10 +181,9 @@ struct ThreadState final {
     // it, or an error for a dormant thread or a resume with no suspend.
     int vm_suspend();
     int vm_resume();
-    // Waits until a ForVM suspend has stopped the thread, then gets the context it stopped with, its
-    // TPIDRURW and whether it stopped inside a kernel call. Returns NOT_SUSPENDED if no ForVM
-    // suspend holds it.
-    SceInt32 get_vm_context(CPUContext &context, uint32_t &tpidrurw, bool &in_kernel_call);
+    // Waits until a ForVM suspend has stopped the thread, then gets the context it stopped with and
+    // whether it stopped inside a kernel call. Returns NOT_SUSPENDED if no ForVM suspend holds it.
+    SceInt32 get_vm_context(CPUContext &context, bool &in_kernel_call);
 
 private:
     // How a thread ends, each value stronger than the ones before it
@@ -199,7 +202,7 @@ private:
         SceInt32 *exit_status;
     };
 
-    // The private methods are called with mutex held, unless they say otherwise
+    // The private methods are called with thread_mutex held, unless they say otherwise
     void update_status(ThreadStatus status);
     // The status the guest sees: SUSPENDED for a thread a ForVM suspend holds at its stop
     ThreadStatus shown_status() const;
@@ -211,36 +214,39 @@ private:
     // Whether something holds the thread before its guest code: the debugger, the emulator pause or
     // a ForVM suspend
     bool held() const;
-    // Waits with mutex held through lock until nothing holds the thread, parked meanwhile
+    // Waits with thread_mutex held through lock until nothing holds the thread, parked meanwhile
     void stop_for_holds(std::unique_lock<std::mutex> &lock);
     // Whether the thread may run guest code now, or kernel code that changes its registers
     bool runs() const { return status == ThreadStatus::running && !parked && !host_waiting; }
     // Asks the thread to end, keeping a stronger request already made
     void request_ending(Ending how) { set_ending(std::max(ending, how)); }
-    // Whether a callback of this thread was notified and hasn't run yet
-    bool callbacks_notified() const { return notified_callbacks > 0; }
-    // Whether a notified callback ends the current wait. Callbacks don't nest, so a wait inside a
-    // callback runs none. With mutex held.
-    bool callback_ends_wait() const { return wait_target.callbacks && !is_processing_callbacks && callbacks_notified(); }
+    // Whether a notified callback ends the current wait. With thread_mutex held.
+    bool callback_ends_wait() const { return wait_target.callbacks && callback_pending; }
     // Whether the thread's current wait is over, by a wake, its end or a callback it runs, though
-    // the thread hasn't gone on yet. With mutex held.
+    // the thread hasn't gone on yet. With thread_mutex held.
     bool wait_over() const { return exiting() || wake_pending || callback_ends_wait(); }
 
-    // Runs guest code at one level, the thread's run or a call, with mutex held through lock, which
+    // Runs guest code at one level, the thread's run or a call, with thread_mutex held through lock, which
     // it releases around guest code and the handling of each exit. A call the kernel makes starts
     // from_kernel_call. Returns r0 once the level's function returns, or nothing once the
     // thread is ending.
     std::optional<uint32_t> run_guest(std::unique_lock<std::mutex> &lock, bool from_kernel_call);
+    // Runs fn with args from ctx until it returns, with thread_mutex held through lock. Returns r0, or
+    // nothing once the thread is ending.
+    std::optional<uint32_t> enter_guest(std::unique_lock<std::mutex> &lock, CPUContext ctx, Address fn, std::initializer_list<uint32_t> args);
+    // Runs a callback or a thread event handler like the kernel does, from the registers of a new
+    // thread on the caller's stack, and puts the caller's registers back after
+    uint32_t run_callback(Address fn, std::initializer_list<uint32_t> args);
     // Ends the thread's run and returns whether it parks dormant for another start
     bool finish_run(std::unique_lock<std::mutex> &lock);
-    // Calls the guest's data abort handler with the abort context on the stack, without mutex held
+    // Calls the guest's data abort handler with the abort context on the stack, without thread_mutex held
     void dispatch_abort(Address fault_addr);
 
     // Fixed when the thread is created
     KernelState &kernel;
     MemState &mem;
 
-    mutable std::mutex mutex;
+    mutable std::mutex thread_mutex;
     // The one condition variable. The thread's waits, its dormant park and its holds wait on it,
     // and so do other threads that wait for its status. Every change any of them reads notifies all.
     std::condition_variable cv;
@@ -271,13 +277,8 @@ private:
     uint64_t last_vblank_waited = 0;
 
     // Callbacks
-    // Callbacks of this thread with notifications they haven't run for.
-    SceUInt32 notified_callbacks = 0;
-    // Set while the thread runs its callbacks. They don't nest. With mutex held.
-    bool is_processing_callbacks = false;
-    // Callbacks this thread created, in creation order. The kernel owns them. Only this thread
-    // touches the list.
-    std::list<std::weak_ptr<Callback>> callbacks;
+    // A callback of this thread was notified since the start of the last callback pass
+    bool callback_pending = false;
 
     // ForVM suspend
     // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet
@@ -296,7 +297,6 @@ private:
     // Blocked in a host wait inside an export
     bool host_waiting = false;
 
-    // Threads blocked in sceKernelWaitThreadEnd on this one, with their own lock, taken after mutex
-    std::mutex end_waiters_mutex;
+    // Threads blocked in sceKernelWaitThreadEnd on this one, guarded by the object's lock
     WaitQueue<EndWaitEntry> end_waiters;
 };
