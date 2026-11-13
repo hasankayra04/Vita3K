@@ -85,8 +85,8 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     void run_loop();
     // Calls a guest function on the thread's CPU from inside a kernel call, usually one the thread
     // itself made, like a function pointer call from library code. The registers are then the ones
-    // the function leaves. Returns its r0, or the exit status if the thread ends during it.
-    uint32_t call_guest(Address fn, std::initializer_list<uint32_t> args);
+    // the function leaves. Returns its r0, or nothing if the thread's or the app's end cut it short.
+    std::optional<uint32_t> call_guest(Address fn, std::initializer_list<uint32_t> args);
     // Starts the dormant thread from another thread and returns its exit status once it ends. Used
     // for module start and stop and the GXM display queue.
     uint32_t start_and_wait(SceSize args, const Ptr<void> argp = Ptr<void>{});
@@ -115,12 +115,12 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     [[nodiscard]] SceInt32 wait_for_signal(SceUInt32 *timeout, bool callbacks);
     // Sends a signal to this thread. Fails if the previous one was not consumed yet.
     SceInt32 send_signal();
-    // Blocks waiter until this thread becomes dormant, then writes its exit status to exit_status.
-    [[nodiscard]] SceInt32 wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks);
-    // Waits on target until woken by wake(), the deadline passes, or the thread exits or is deleted,
-    // which ends it with THREAD_STOPPED.
-    // With target.callbacks, a notified callback ends it with NOTIFY_CALLBACK, and the caller runs
-    // it with run_callbacks(). A stale wake can end it early, so callers must recheck their condition.
+    // Blocks waiter until this thread becomes dormant or deleted, then writes its exit status to
+    // exit_status. The time left is written back to timeout after every sleep.
+    [[nodiscard]] SceInt32 wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, SceUInt32 *timeout, bool callbacks);
+    // sleep(), but a callback already pending ends a wait with callbacks at once with NOTIFY_CALLBACK,
+    // and the caller then runs it with run_callbacks(). A stale wake can end it early, so callers must
+    // recheck their condition.
     [[nodiscard]] SceInt32 wait(WaitTarget target, Deadline deadline);
     // Runs the notified callbacks for a wait that ended with NOTIFY_CALLBACK, with no lock held.
     // Returns THREAD_STOPPED if the thread exits or is deleted meanwhile.
@@ -158,6 +158,10 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     SceUInt32 process_callbacks();
     // Returns whether a callback of this thread was notified since its last callback pass
     bool has_pending_callbacks();
+
+    // Thread event handlers
+    // Whether the thread runs its thread event handlers.
+    bool in_event_handler() const;
 
     // Holds: the debugger, the emulator pause and the ForVM suspend
     // Stops the thread for the debugger the next time it would run guest code, or lets it run again.
@@ -220,11 +224,11 @@ private:
     bool runs() const { return status == ThreadStatus::running && !parked && !host_waiting; }
     // Asks the thread to end, keeping a stronger request already made
     void request_ending(Ending how) { set_ending(std::max(ending, how)); }
-    // Whether a notified callback ends the current wait. With thread_mutex held.
-    bool callback_ends_wait() const { return wait_target.callbacks && callback_pending; }
-    // Whether the thread's current wait is over, by a wake, its end or a callback it runs, though
-    // the thread hasn't gone on yet. With thread_mutex held.
-    bool wait_over() const { return exiting() || wake_pending || callback_ends_wait(); }
+    // Whether the thread's current wait has a result or the thread is ending. With thread_mutex held.
+    bool wait_over() const { return exiting() || wait_result.has_value(); }
+    // Sleeps on target until wake(), a callback notify during the sleep if target.callbacks, the
+    // deadline, or the thread's exit or delete (THREAD_STOPPED), with thread_mutex held through lock.
+    [[nodiscard]] SceInt32 sleep(std::unique_lock<std::mutex> &lock, WaitTarget target, Deadline deadline);
 
     // Runs guest code at one level, the thread's run or a call, with thread_mutex held through lock, which
     // it releases around guest code and the handling of each exit. A call the kernel makes starts
@@ -235,12 +239,19 @@ private:
     // nothing once the thread is ending.
     std::optional<uint32_t> enter_guest(std::unique_lock<std::mutex> &lock, CPUContext ctx, Address fn, std::initializer_list<uint32_t> args);
     // Runs a callback or a thread event handler like the kernel does, from the registers of a new
-    // thread on the caller's stack, and puts the caller's registers back after
-    uint32_t run_callback(Address fn, std::initializer_list<uint32_t> args);
+    // thread on the caller's stack, and puts the caller's registers back after. Returns its r0, or
+    // nothing if the thread's or the app's end cut it short.
+    std::optional<uint32_t> run_callback(Address fn, std::initializer_list<uint32_t> args);
     // Ends the thread's run and returns whether it parks dormant for another start
     bool finish_run(std::unique_lock<std::mutex> &lock);
     // Calls the guest's data abort handler with the abort context on the stack, without thread_mutex held
     void dispatch_abort(Address fault_addr);
+    // Runs the thread's event handlers for type in registration order, releasing thread_mutex
+    // through lock while they run
+    void run_event_handlers(std::unique_lock<std::mutex> &lock, SceUInt32 type);
+    // Exits the thread as how with status, or ends the app inside a callback or a thread event
+    // handler. Without thread_mutex held.
+    void request_exit(Ending how, SceInt32 status);
 
     // Fixed when the thread is created
     KernelState &kernel;
@@ -264,6 +275,8 @@ private:
     Ending ending = Ending::none;
     // Run the thread start event once before guest code. Set by start().
     bool run_start_callback = false;
+    // The thread runs its thread event handlers. Set and cleared by run_event_handlers().
+    bool running_event_handlers = false;
 
     // Priority and affinity
     int priority;
@@ -272,8 +285,8 @@ private:
     // Waits
     // What the thread waits on while waiting, empty otherwise
     WaitTarget wait_target;
-    // Set by wake() and consumed by the next wait().
-    bool wake_pending = false;
+    // The result the next wait() returns, set by the first wake() or callback notify
+    std::optional<SceInt32> wait_result;
     // A sceKernelSendSignal is pending for this thread.
     bool signal_pending = false;
     // The vblank the thread's last display wait ended on
@@ -282,6 +295,8 @@ private:
     // Callbacks
     // A callback of this thread was notified since the start of the last callback pass
     bool callback_pending = false;
+    // The callback runs going on, nested ones too
+    int callback_depth = 0;
 
     // ForVM suspend
     // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet

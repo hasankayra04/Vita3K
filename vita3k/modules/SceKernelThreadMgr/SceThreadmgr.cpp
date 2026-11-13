@@ -54,6 +54,24 @@ static void write_info(T *info, T full, SceSize size) {
     memcpy(info, &full, size);
 }
 
+// Copies a guest string of at most out.size() - 1 characters to out. Returns its length, out.size() if it is longer, or -1 if a byte isn't mapped.
+static int copy_guest_string(const MemState &mem, Ptr<const char> str, std::span<char> out) {
+    const int size = static_cast<int>(out.size());
+    for (int length = 0; length < size; length++) {
+        const Address addr = str.address() + length;
+        if (!is_valid_addr(mem, addr)) {
+            out[0] = '\0';
+            return -1;
+        }
+        const char c = *Ptr<const char>(addr).get(mem);
+        out[length] = c;
+        if (c == '\0')
+            return length;
+    }
+    out[size - 1] = '\0';
+    return size;
+}
+
 // Finds a simple event or a timer, which are both events.
 static EventPtr find_event(EmuEnvState &emuenv, SceUID event_id) {
     if (SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
@@ -243,7 +261,10 @@ EXPORT(SceUID, _sceKernelCreateEventFlag, const char *pName, SceUInt32 attr, Sce
 
 EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const char *name, SceUInt attr, Ptr<SceKernelCreateLwCond_opt> opt) {
     TRACY_FUNC(_sceKernelCreateLwCond, workarea, name, attr, opt);
-    const auto assoc_mutex_uid = opt.get(emuenv.mem)->workarea_mutex.get(emuenv.mem)->uid;
+    const Ptr<SceKernelLwMutexWork> mutex_work = opt.get(emuenv.mem)->workarea_mutex;
+    if (!workarea || !mutex_work)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    const auto assoc_mutex_uid = mutex_work.get(emuenv.mem)->uid;
 
     if (const SceInt32 error = SyncPrimitive::check_name(name, attr))
         return RET_ERROR(error);
@@ -733,9 +754,20 @@ EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadIn
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, _sceKernelGetThreadRunStatus) {
-    TRACY_FUNC(_sceKernelGetThreadRunStatus);
-    return UNIMPLEMENTED();
+// Fills only the caller's core, the other entries keep what the caller passed since Vita3K doesn't know what those cores run
+EXPORT(SceInt32, _sceKernelGetThreadRunStatus, SceKernelThreadRunStatus *status, const SceSize *size) {
+    TRACY_FUNC(_sceKernelGetThreadRunStatus, status, size);
+    if (!status || !size)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    if (*size > sizeof(*status))
+        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+    const SceKernelThreadInfo info = emuenv.kernel.get_thread(thread_id)->info();
+    SceKernelThreadRunStatus record{};
+    memcpy(&record, status, *size);
+    record.size = sizeof(record);
+    record.cpuInfo[info.lastExecutedCpuId] = { info.processId, thread_id, info.currentPriority };
+    memcpy(status, &record, *size);
+    return SCE_KERNEL_OK;
 }
 
 EXPORT(int, _sceKernelGetTimerBase) {
@@ -915,28 +947,27 @@ EXPORT(int, _sceKernelReceiveMsgPipeVectorCB) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, _sceKernelRegisterThreadEventHandler, const char *name, SceUID thread_mask, SceUInt32 mask, sceKernelRegisterThreadEventHandlerOpt *opt) {
+EXPORT(SceUID, _sceKernelRegisterThreadEventHandler, Ptr<const char> name, SceUID thread_mask, SceUInt32 mask, sceKernelRegisterThreadEventHandlerOpt *opt) {
     TRACY_FUNC(_sceKernelRegisterThreadEventHandler, name, thread_mask, mask, opt);
     if (!opt)
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-
-    if (mask & SCE_KERNEL_THREAD_EVENT_TYPE_START) {
-        if (emuenv.kernel.thread_event_start)
-            LOG_WARN("Multiple thread handlers are not supported");
-
-        emuenv.kernel.thread_event_start = opt->handler;
-        emuenv.kernel.thread_event_start_arg = opt->common;
-    }
-
-    if (mask & SCE_KERNEL_THREAD_EVENT_TYPE_END) {
-        if (emuenv.kernel.thread_event_end)
-            LOG_WARN("Multiple thread handlers are not supported");
-
-        emuenv.kernel.thread_event_end = opt->handler;
-        emuenv.kernel.thread_event_end_arg = opt->common;
-    }
-
-    return SCE_KERNEL_OK;
+    if (!name)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    char name_copy[SCE_UID_NAMELEN + 1];
+    if (copy_guest_string(emuenv.mem, name, name_copy) < 0)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    const SceUID target = thread_mask ? thread_mask : thread_id;
+    if (target != SCE_KERNEL_THREAD_ID_PROCESS_ALL_ID && !emuenv.kernel.get_thread(target))
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    if (emuenv.kernel.get_thread(thread_id)->in_event_handler())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // A thread that registers for itself has started already, so it can only ask for its end
+    const bool bad_mask = target == thread_id ? mask != SCE_KERNEL_THREAD_EVENT_TYPE_END : (mask & ~(SCE_KERNEL_THREAD_EVENT_TYPE_START | SCE_KERNEL_THREAD_EVENT_TYPE_END)) != 0;
+    if (bad_mask)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    if (!is_valid_addr(emuenv.mem, opt->handler.address() & ~1))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    return emuenv.kernel.objects.add(std::make_shared<ThreadEventHandler>(name_copy, target, mask, opt->handler.address(), opt->common), emuenv.kernel.get_next_uid());
 }
 
 EXPORT(int, _sceKernelSendMsgPipeVector) {
@@ -1024,16 +1055,16 @@ EXPORT(int, _sceKernelSignalLwCondTo) {
 
 EXPORT(int, _sceKernelStartThread, SceUID thid, SceSize arglen, Ptr<void> argp) {
     TRACY_FUNC(_sceKernelStartThread, thid, arglen, argp);
+    if (thid == 0)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
     auto thread = emuenv.kernel.get_thread(thid);
-
-    if (!thread) {
+    if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
-    }
-
+    if (emuenv.kernel.get_thread(thread_id)->in_event_handler())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     const int res = thread->start(arglen, argp, true);
-    if (res < 0) {
+    if (res < 0)
         return RET_ERROR(res);
-    }
     return res;
 }
 
@@ -1166,23 +1197,31 @@ EXPORT(SceInt32, _sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUIn
     return result;
 }
 
+// Waits for a signal to thread, writing the time left back to timeout once the wait ends
+static int wait_signal(const ThreadStatePtr &thread, SceUInt32 *timeout, bool callbacks) {
+    SceUInt32 time_left = timeout ? *timeout : 0;
+    const SceInt32 r = thread->wait_for_signal(timeout ? &time_left : nullptr, callbacks);
+    if (timeout)
+        *timeout = time_left;
+    return r;
+}
+
 EXPORT(int, _sceKernelWaitSignal, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
     TRACY_FUNC(_sceKernelWaitSignal, unknown, delay, timeout);
-    return emuenv.kernel.get_thread(thread_id)->wait_for_signal(timeout, false);
+    return wait_signal(emuenv.kernel.get_thread(thread_id), timeout, false);
 }
 
 EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
     TRACY_FUNC(_sceKernelWaitSignalCB, unknown, delay, timeout);
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    thread->process_callbacks();
-    return thread->wait_for_signal(timeout, true);
+    return wait_signal(emuenv.kernel.get_thread(thread_id), timeout, true);
 }
 
-// Waits for target to end, writing the time left back to timeout
+// Waits for target to end, writing the time left back to timeout once the wait ends
 static int wait_thread_end(const ThreadStatePtr &waiter, const ThreadStatePtr &target, int *stat, SceUInt *timeout, bool callbacks) {
-    const Deadline deadline = deadline_from(timeout);
-    const SceInt32 r = target->wait_for_thread_end(waiter, stat, deadline, callbacks);
-    writeback_timeout(timeout, deadline);
+    SceUInt32 time_left = timeout ? *timeout : 0;
+    const SceInt32 r = target->wait_for_thread_end(waiter, stat, timeout ? &time_left : nullptr, callbacks);
+    if (timeout)
+        *timeout = time_left;
     return r;
 }
 
@@ -1205,7 +1244,6 @@ EXPORT(int, _sceKernelWaitThreadEndCB, SceUID thid, int *stat, SceUInt *timeout)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
     if (target == waiter)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
-    waiter->process_callbacks();
     return wait_thread_end(waiter, target, stat, timeout, true);
 }
 
@@ -1354,24 +1392,6 @@ EXPORT(int, sceKernelCloseTimer) {
     return STUBBED("References not implemented.");
 }
 
-// Copies a guest string of at most out.size() - 1 characters to out. Returns its length, out.size() if it is longer, or -1 if a byte isn't mapped.
-static int copy_guest_string(const MemState &mem, Ptr<const char> str, std::span<char> out) {
-    const int size = static_cast<int>(out.size());
-    for (int length = 0; length < size; length++) {
-        const Address addr = str.address() + length;
-        if (!is_valid_addr(mem, addr)) {
-            out[0] = '\0';
-            return -1;
-        }
-        const char c = *Ptr<const char>(addr).get(mem);
-        out[length] = c;
-        if (c == '\0')
-            return length;
-    }
-    out[size - 1] = '\0';
-    return size;
-}
-
 EXPORT(SceUID, sceKernelCreateCallback, Ptr<const char> name, SceUInt32 attr, Ptr<SceKernelCallbackFunction> callbackFunc, Ptr<void> pCommon) {
     TRACY_FUNC(sceKernelCreateCallback, name, attr, callbackFunc, pCommon);
     if (!name)
@@ -1411,6 +1431,8 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
     if (options->stack_size <= 0)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE);
+    if (emuenv.kernel.get_thread(thread_id)->in_event_handler())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
     if (options->attr & ~THREAD_CREATE_ATTRS)
@@ -1543,12 +1565,16 @@ EXPORT(int, sceKernelDeleteSimpleEvent, SceUID event_id) {
 
 EXPORT(int, sceKernelDeleteThread, SceUID thid) {
     TRACY_FUNC(sceKernelDeleteThread, thid);
-    // A thread can't delete itself, it has to exit and delete
-    if (thid == thread_id)
+    if (thid == 0)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thid);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    if (emuenv.kernel.get_thread(thread_id)->in_event_handler())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // A thread can't delete itself, it has to exit and delete
+    if (thid == thread_id)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
     if (const SceInt32 error = thread->remove_dormant())
         return RET_ERROR(error);
     return 0;
@@ -1671,23 +1697,42 @@ EXPORT(SceInt32, sceKernelNotifyCallback, SceUID callbackId, SceInt32 notifyArg)
     return SCE_KERNEL_OK;
 }
 
-// Finds the openable object of type T with this name and returns its UID
-template <KernelObjectClass T>
-static SceUID open_by_name(EmuEnvState &emuenv, const char *export_name, Ptr<const char> name) {
+// Finds the openable object of any class with this guest name, or returns the error for the name
+static SceInt32 find_by_name(EmuEnvState &emuenv, Ptr<const char> name, std::shared_ptr<KernelObject> &object) {
     if (!name)
-        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
     char name_copy[SCE_UID_NAMELEN + 1];
     const int name_length = copy_guest_string(emuenv.mem, name, name_copy);
     if (name_length < 0)
-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+        return SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS;
     if (name_length > SCE_UID_NAMELEN)
-        return RET_ERROR(SCE_KERNEL_ERROR_UID_NAME_TOO_LONG);
-    const auto found = emuenv.kernel.objects.find_if<T>([&](const T &object) {
-        return (object.attr & SCE_KERNEL_ATTR_OPENABLE) && strncmp(object.name, name_copy, sizeof(object.name)) == 0;
-    });
-    if (!found)
-        return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
-    return found->uid;
+        return SCE_KERNEL_ERROR_UID_NAME_TOO_LONG;
+    object = emuenv.kernel.objects.find_openable(name_copy);
+    if (!object)
+        return SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME;
+    return SCE_KERNEL_OK;
+}
+
+// Opens the T with this name. The thread manager finds the name and checks the class itself
+template <KernelObjectClass T>
+static SceUID open_by_name(EmuEnvState &emuenv, const char *export_name, Ptr<const char> name) {
+    std::shared_ptr<KernelObject> object;
+    if (const SceInt32 error = find_by_name(emuenv, name, object))
+        return RET_ERROR(error);
+    if (object->get_uid_class() != T::uid_class)
+        return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
+    return object->uid;
+}
+
+// Opens the T with this name. Sysmem finds the name and checks the class in one call
+template <KernelObjectClass T>
+static SceUID sysmem_open_by_name(EmuEnvState &emuenv, const char *export_name, Ptr<const char> name) {
+    std::shared_ptr<KernelObject> object;
+    if (const SceInt32 error = find_by_name(emuenv, name, object))
+        return RET_ERROR(error);
+    if (object->get_uid_class() != T::uid_class)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_UID_CLASS);
+    return object->uid;
 }
 
 EXPORT(SceUID, sceKernelOpenCond, Ptr<const char> pName) {
@@ -1702,7 +1747,7 @@ EXPORT(SceUID, sceKernelOpenEventFlag, Ptr<const char> pName) {
 
 EXPORT(SceUID, sceKernelOpenMsgPipe, Ptr<const char> pName) {
     TRACY_FUNC(sceKernelOpenMsgPipe, pName);
-    return open_by_name<MsgPipe>(emuenv, export_name, pName);
+    return sysmem_open_by_name<MsgPipe>(emuenv, export_name, pName);
 }
 
 EXPORT(SceUID, sceKernelOpenMutex, Ptr<const char> pName) {
@@ -1727,7 +1772,7 @@ EXPORT(SceUID, sceKernelOpenSema, Ptr<const char> pName) {
 
 EXPORT(SceUID, sceKernelOpenSimpleEvent, Ptr<const char> pName) {
     TRACY_FUNC(sceKernelOpenSimpleEvent, pName);
-    const SceUID uid = open_by_name<SimpleEvent>(emuenv, export_name, pName);
+    const SceUID uid = sysmem_open_by_name<SimpleEvent>(emuenv, export_name, pName);
     if (uid < 0)
         return uid;
     // A delete that came first wins, as if the name wasn't found
@@ -1739,7 +1784,7 @@ EXPORT(SceUID, sceKernelOpenSimpleEvent, Ptr<const char> pName) {
 
 EXPORT(SceUID, sceKernelOpenTimer, Ptr<const char> pName) {
     TRACY_FUNC(sceKernelOpenTimer, pName);
-    return open_by_name<Timer>(emuenv, export_name, pName);
+    return sysmem_open_by_name<Timer>(emuenv, export_name, pName);
 }
 
 EXPORT(int, sceKernelPollSema, SceUID semaid, int32_t needCount) {
@@ -1930,9 +1975,17 @@ EXPORT(int, sceKernelUnregisterCallbackFromEventAll) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelUnregisterThreadEventHandler) {
-    TRACY_FUNC(sceKernelUnregisterThreadEventHandler);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, sceKernelUnregisterThreadEventHandler, SceUID uid) {
+    TRACY_FUNC(sceKernelUnregisterThreadEventHandler, uid);
+    if (!emuenv.kernel.objects.find(uid))
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_EVENT_ID);
+    if (emuenv.kernel.get_thread(thread_id)->in_event_handler())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // A registration a run released keeps its UID once no run of it is left, but no call finds it
+    const auto handler = emuenv.kernel.objects.find<ThreadEventHandler>(uid);
+    if (!handler || !handler->release() || !emuenv.kernel.objects.remove<ThreadEventHandler>(uid, thread_id))
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_EVENT_ID);
+    return SCE_KERNEL_OK;
 }
 
 EXPORT(int, sceKernelWaitThreadEndCB_089) {

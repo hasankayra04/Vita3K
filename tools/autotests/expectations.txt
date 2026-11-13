@@ -37,10 +37,10 @@ callback_errors                 pass
 callback_event_results          fail     # event calls don't take message pipe UIDs
 callback_event_waits            pass
 callback_exit_call              pass
-callback_exit_check             fail     # an exit inside a callback doesn't end the app
-callback_exit_delay             fail     # an exit inside a callback doesn't end the app
-callback_exit_delete_check      fail     # an exit inside a callback doesn't end the app
-callback_exit_delete_delay      fail     # an exit inside a callback doesn't end the app
+callback_exit_check             pass
+callback_exit_delay             pass
+callback_exit_delete_check      pass
+callback_exit_delete_delay      pass
 callback_function_memory        fail     # a callback create takes a function in a USER_RW block or on the stack
 callback_info                   pass
 callback_info_fields            fail     # callbacks registered to simple events aren't notified by its sets
@@ -88,21 +88,21 @@ cancel_calls                    pass
 cancel_calls_more               fail     # sceKernelWaitMultipleEvents
 cancel_unknown_counts           fail     # failed event flag, simple event, message pipe and timer cancels leave their counts as they were
 cb_wait_callback_writes_timeout pass
-cb_wait_callback_writes_timeout_more fail     # signal and thread end waits with callbacks read their timeout only after the pending callbacks ran, so a callback's write sets their timeout
+cb_wait_callback_writes_timeout_more pass
 cb_wait_check_order             pass
 cb_wait_check_order_more        fail     # a message pipe call refused for its size doesn't run pending callbacks
-cb_wait_deadline_during_callback fail     # a signal or thread end wait whose deadline passes during a callback writes a time left of 0
+cb_wait_deadline_during_callback pass
 cb_wait_early_notify_timeout    pass
-cb_wait_early_notify_timeout_more fail     # a signal wait with callbacks runs a callback again after it notified itself, so it gets the signal at once instead of timing out
+cb_wait_early_notify_timeout_more pass
 cb_wait_initial_callback_deadline pass
-cb_wait_initial_callback_deadline_more fail     # signal and thread end waits count their timeout from after the callbacks pending at the call, not from the call
-cb_wait_self_notify_during_sleep fail     # a signal wait runs a callback that notified itself again before it sleeps, where the Vita sleeps with it pending
+cb_wait_initial_callback_deadline_more pass
+cb_wait_self_notify_during_sleep pass
 cb_wait_take_final_check        pass
-cb_wait_take_final_check_more   fail     # a delay runs a callback pending again on its first pass instead of returning, and sceKernelWaitMultipleEvents
+cb_wait_take_final_check_more   fail     # sceKernelWaitMultipleEvents
 cb_wait_timeout_copy            pass
 cb_wait_timeout_copy_more       fail     # sceKernelWaitMultipleEvents
 cb_wait_zero_timeout_notify     pass
-cb_wait_zero_timeout_notify_more fail     # a signal or thread end wait with callbacks and a timeout of 0 runs a callback that notified itself again, and gets what that run gave instead of timing out
+cb_wait_zero_timeout_notify_more pass
 cb_waits                        fail     # sceKernelWaitMultipleEvents
 ceiling_base_change             fail     # a mutex ceiling doesn't raise its owner's priority
 ceiling_cancel_drops_boost      fail     # a ceiling mutex doesn't raise its owner's priority
@@ -158,10 +158,10 @@ core_choice                     fail     # the CPU fields of thread info, thread
 cpu_fetch_data_page             fail     # code in a read and write block runs
 cpu_fetch_freed_block           timeout  # a fetch outside guest memory reads zeros and runs them
 cpu_fetch_freed_code            fail     # a thread still runs the code it ran from a block that was freed since
-cpu_fetch_null_arm              timeout  # a fetch fault ends only the call, with its r0, so the worker never signals
-cpu_fetch_null_callback         fail     # a fetch fault ends only the callback and the app goes on, and thread event handlers are global and registering one returns 0, not a UID
-cpu_fetch_null_end_wait         fail     # a fetch fault ends only the call, with its r0, and the app goes on
-cpu_fetch_null_thumb            timeout  # a fetch fault ends only the call, with its r0, so the worker never signals
+cpu_fetch_null_arm              pass
+cpu_fetch_null_callback         pass
+cpu_fetch_null_end_wait         pass
+cpu_fetch_null_thumb            pass
 cpu_fetch_vm_block              pass
 cpu_strex_overlap               fail     # a strex whose status register is also its value or base register does nothing and leaves the monitor open
 cpu_undefined_arm               fail     # an undefined instruction is skipped and the app goes on
@@ -173,9 +173,9 @@ create_attributes               fail     # the attributes condition variables, l
 create_attrs                    fail     # the attribute bits each create accepts
 cross_core_scheduling           fail     # threads ignore their core and priority
 delay                           pass
-delay_cb_early_return           fail     # a delay runs a callback that notified itself again and sleeps instead of returning with it pending
+delay_cb_early_return           pass
 delay_cb_one_yields             pass
-delay_cb_self_notify            fail     # a delay or a signal wait runs a callback that notified itself again instead of returning or sleeping with it pending
+delay_cb_self_notify            pass
 delay_huge_values               pass
 delay_negative                  pass
 delay_precision                 skip     # timing, and waits with a timeout of 50 or 100 microseconds end before 150
@@ -184,14 +184,15 @@ delay_wait_id                   pass
 delete_race_end_waiters         pass
 delete_with_waiters             pass
 delete_with_waiters_more        fail     # sceKernelWaitMultipleEvents
-directories                     fail     # directory mode, not empty and wrong type errors
+directories                     fail     # directory mode and wrong type errors
 display                         crash    # display size, framebuffer pitch checks, a NULL pointer
 display_framebuf_blocks         fail     # no framebuffer base alignment check
 display_framebuf_free           skip     # whether the renderer crashes on a freed framebuffer depends on timing
 display_framebuf_set_freed      skip     # a framebuffer where a block was freed is taken, whether the renderer crashes on it depends on timing
-end_wait_claim_races            fail     # threads ignore their core and priority, so a timed out waiter has already ended, and an end wait takes an end during its callback instead of waiting again
+end_wait_cb_notify_then_end     skip     # threads ignore their core and priority, so whether the waiter and the target already ran when their status is read is a race
+end_wait_claim_races            fail     # threads ignore their core and priority, so a timed out waiter has already ended
 end_wait_cycle                  pass
-end_wait_during_end_handler     fail     # end waiters are woken before the END handler runs
+end_wait_during_end_handler     pass
 end_wait_error_order            fail     # a thread end wait on UID 0 gives UNKNOWN_THREAD_ID, not ILLEGAL_THREAD_ID
 end_wait_exit_preempt           fail     # threads ignore their priority, so the run order after the end differs
 end_waiter_priority_change      skip     # threads ignore their core and priority, so end waiters woken together run in host order
@@ -243,7 +244,7 @@ forvm_suspend_core_handover     fail     # the ForVM suspend hands the core over
 forvm_suspend_exact_counts      fail     # thread info's preempt counters stay 0
 forvm_suspend_preempt_count     fail     # the interrupt preempt count of thread info stays 0, a ForVM suspend doesn't grow it
 fpscr_flags_across_calls        fail     # the start handler sees an inexact flag (0x10) in FPSCR that the Vita does not set
-gxm_context_memory              fail     # sceGxmCreateContext checks no buffer size, alignment, mapping or NULL pointer
+gxm_context_memory              fail     # sceGxmCreateContext checks no buffer size, alignment, mapping or NULL ring buffer
 gxm_deferred_callback_recorder  skip     # a VDM memory callback during B's draws runs as a call on A, the thread that began the command list, while A waits for B, so whether B hangs depends on whether its draws need a ring refill
 gxm_deferred_callback_threads   fail     # sceGxmBeginCommandList also calls the vertex and fragment memory callbacks
 gxm_deferred_ring_usage         fail     # the command list words are a host pointer, the deferred buffer getters return the buffer's start, a draw without the default uniform reserve succeeds, and 1 KiB of VDM holds 13 empty lists or 79 draws, not 96 or 23
@@ -283,7 +284,7 @@ lock_calls_callback_runs        pass
 lock_failed_at_once_state       pass
 lowered_to_shared               fail     # threads ignore their core
 lw_cond                         pass
-lw_cond_errors                  fail     # create checks of the attribute, a NULL mutex and a NULL work area, a signal to thread 0
+lw_cond_errors                  fail     # create checks of the attribute, a signal to thread 0
 lw_cond_relock_requeue          fail     # a lightweight condition waiter taking its mutex back isn't requeued on a priority change
 lw_cond_semantics               pass
 lw_cond_work_words              fail     # the lightweight mutex work area's wait count word isn't written
@@ -459,7 +460,7 @@ mutex_recursive_partial_unlock_waiter pass
 mutex_rwlock_create_options     fail     # rwlock creates accept option sizes that the Vita rejects with 0x8002000B
 mutex_waiter_counts             pass
 mutex_waits                     pass
-name_lookup                     fail     # opening gives the object's own UID, opening objects of another type or that aren't openable
+name_lookup                     fail     # opening gives the object's own UID, openable names aren't unique, a condition variable takes the openable attribute
 narrow_mask_onto_equal_core     fail     # threads ignore their core
 nonblocking_wait_preempt        fail     # threads ignore their core and priority
 nonobject_wait_priority_change  fail     # threads ignore their priority, so a woken thread below the main thread runs at once
@@ -576,7 +577,7 @@ signal_state_across_restart     fail     # a thread's start keeps a signal sent 
 signal_wait_arguments           pass
 signal_wait_callbacks_first     pass
 signal_wait_claim_races         fail     # a woken thread runs at once, so it has ended when the main thread reads its status
-signal_wait_second_notify       fail     # a signal wait runs a callback that notified itself again before it sleeps, where the Vita sleeps with it pending
+signal_wait_second_notify       pass
 simple_event                    pass
 simple_event_auto_waiters       pass
 simple_event_cancel             pass
@@ -652,45 +653,45 @@ thread_create_relative_priority pass
 thread_creator_ends             pass
 thread_delete_lookup            pass
 thread_edges                    pass
-thread_end_handler_wake         fail     # an END handler runs twice for a thread whose end wait wakes a thread above it
+thread_end_handler_wake         skip     # threads ignore their core and priority, so whether the end waiter above T runs before the END handler returns is a race
 thread_end_restart              pass
 thread_end_wait_more            pass
 thread_end_waits                pass
 thread_entry_block_types        fail     # app data and USER_RW addresses are accepted as thread or callback entries
 thread_errors                   pass
-thread_event_handler            fail     # unknown thread and handler errors
-thread_event_handler_check_order fail     # thread manager calls inside a thread event handler check in another order, and no execute permission tracking, so a handler at a data address is accepted
-thread_event_handler_context    fail     # create and start inside a thread event handler
-thread_event_handler_delete_refused fail     # a delete inside a thread event handler isn't refused
-thread_event_handler_delete_self fail     # a delete inside a thread event handler isn't refused, and a delete of thread 0 reports an unknown thread
-thread_event_handler_edges      fail     # one start and one end handler for every thread whatever was registered, and an end handler sees the exit status instead of NOT_DORMANT
-thread_event_handler_end_return_negative fail     # an END handler returning -1 stays registered
+thread_event_handler            pass
+thread_event_handler_check_order fail     # no execute permission tracking, so a handler at a data address is accepted
+thread_event_handler_context    pass
+thread_event_handler_delete_refused pass
+thread_event_handler_delete_self pass
+thread_event_handler_edges      pass
+thread_event_handler_end_return_negative pass
 thread_event_handler_every_thread_running pass
-thread_event_handler_exit_callback_call fail     # _sceKernelExitCallback is unimplemented, so it returns to the handler, which is kept whatever the value
-thread_event_handler_exit_delete_end fail     # an exit inside a thread event handler doesn't end the app
-thread_event_handler_exit_delete_start fail     # an exit inside a thread event handler doesn't end the app
-thread_event_handler_exit_end   fail     # an exit inside a thread event handler doesn't end the app
-thread_event_handler_exit_start fail     # an exit inside a thread event handler doesn't end the app
+thread_event_handler_exit_callback_call pass
+thread_event_handler_exit_delete_end pass
+thread_event_handler_exit_delete_start pass
+thread_event_handler_exit_end   pass
+thread_event_handler_exit_start pass
 thread_event_handler_holds      pass
-thread_event_handler_mask_bits  fail     # thread event handler masks with bits other than START and END are accepted
-thread_event_handler_mixed_order fail     # only the last registered handler of a thread runs
-thread_event_handler_null_name  fail     # a NULL thread event handler name is accepted
+thread_event_handler_mask_bits  pass
+thread_event_handler_mixed_order pass
+thread_event_handler_null_name  pass
 thread_event_handler_process_exit pass
-thread_event_handler_register_before_run pass
-thread_event_handler_release_unregister_running fail     # thread event handlers are global and an unregister always returns 0
-thread_event_handler_shared_release fail     # thread event handlers are global and registering one returns 0, not a UID, and an unregister inside a handler isn't refused
+thread_event_handler_register_before_run skip     # threads ignore their core, so in case b the thread runs its START handlers before the main thread registers one, or after, by host timing
+thread_event_handler_release_unregister_running pass
+thread_event_handler_shared_release pass
 thread_event_handler_stack      fail     # event handler sp is 0x28 below the stack top and 16 aligned, the Vita's is 0x30
 thread_event_handler_start_sp   fail     # an END handler starts on the entry's stack pointer, the Vita starts it below it
-thread_event_handler_start_target fail     # a start of a thread that runs its own thread event handler isn't refused
-thread_event_handler_unregister_in_entry fail     # an unregister from the thread's own entry doesn't stop its END run
-thread_event_handler_unregister_other_uids fail     # an unregister always returns 0, whatever the UID
+thread_event_handler_start_target pass
+thread_event_handler_unregister_in_entry pass
+thread_event_handler_unregister_other_uids fail     # an unregister inside a thread event handler of a UID that isn't a sync object, callback or handler, like a thread or memory block UID, gives 0x80028061, not 0x80027101
 thread_event_handler_vfp        pass
-thread_exit_status              fail     # an end wait for an ended thread writes back part of its timeout
+thread_exit_status              pass
 thread_for_vm_errors            pass
 thread_fpscr                    pass
 thread_id_registers             pass
 thread_info                     pass
-thread_info_fields              fail     # thread info's run time, the last CPU is 0 since threads ignore their core, sceKernelGetThreadRunStatus
+thread_info_fields              fail     # thread info's run time, the last CPU is 0 since threads ignore their core
 thread_info_sizes               pass
 thread_lifecycle                fail     # starting with more arguments than the stack holds
 thread_limit_release            fail     # thread creates aren't refused at the Vita's limit, which gives 0x8002450D
@@ -706,11 +707,11 @@ thread_ready_status             fail     # a thread that can run but doesn't rep
 thread_restart                  fail     # the stack free size of a thread started again
 thread_run_clocks               fail     # the run clocks don't count the time a thread spins
 thread_run_order                fail     # threads ignore their core and priority
-thread_run_status               fail     # sceKernelGetThreadRunStatus
-thread_run_status_cores         fail     # sceKernelGetThreadRunStatus gives the wrong entry, process and priority on both cores
-thread_run_status_in_handler    fail     # sceKernelGetThreadRunStatus is unimplemented
-thread_run_status_waiting_thread fail     # sceKernelGetThreadRunStatus is unimplemented
-thread_self_calls               fail     # calls with UID 0 or the thread's own UID give other errors than 0x80028022
+thread_run_status               pass
+thread_run_status_cores         fail     # threads ignore their core, so sceKernelGetThreadRunStatus fills only the caller's entry, on core 0
+thread_run_status_in_handler    pass
+thread_run_status_waiting_thread pass
+thread_self_calls               fail     # StartThread with the thread's own UID and GetThreadExitStatus with UID 0 or its own UID give other errors than 0x80028022
 thread_signal                   pass
 thread_signal_timeout           pass
 thread_signal_wait_id           pass
@@ -726,7 +727,7 @@ thread_stack_zero               pass
 thread_start_arg_limit          fail     # a start whose argument size is past the stack is accepted, the Vita refuses it
 thread_start_arg_registers      fail     # the arguments 8 bytes aligned, the size in r0 for a NULL pointer
 thread_start_cpsr               fail     # the CPSR a thread reads has no mode bits
-thread_start_handler_preempt    fail     # a START handler runs twice for a thread that preempts its starter
+thread_start_handler_preempt    fail     # threads ignore their core and priority, so T doesn't preempt its starter when it starts
 thread_start_races              pass
 thread_start_registers          fail     # the arguments and sp 8 bytes below the stack top, not 16
 thread_state                    pass
