@@ -741,7 +741,7 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
     // A main thread without its own affinity runs on every user core and reports them all
     if (affinity == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
         affinity = SCE_KERNEL_CPU_MASK_USER_ALL;
-    const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, 0);
+    const ThreadStateRef main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, 0);
     if (!main_thread) {
         LOG_ERROR("Failed to init main thread.");
         return InitThreadFailed;
@@ -750,6 +750,9 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
 
     // Before any guest code runs, module_start functions included, since they can read it too
     emuenv.set_launch_uri(emuenv.cfg.launch_uri);
+
+    // Before any guest code runs, since it may wait for a vblank or register a vblank callback
+    start_sync_thread(emuenv);
 
     // Run `module_start` export (entry point) of loaded libraries
     for (auto &[_, module] : emuenv.kernel.loaded_modules) {
@@ -778,8 +781,6 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
         LOG_ERROR("Failed to run main thread.");
         return RunThreadFailed;
     }
-
-    start_sync_thread(emuenv);
 
     return Success;
 }

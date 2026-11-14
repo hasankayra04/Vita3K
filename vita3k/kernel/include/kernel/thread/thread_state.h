@@ -19,8 +19,8 @@
 
 #include <cpu/common.h>
 #include <kernel/callback.h>
-#include <kernel/sync_primitive.h>
 #include <kernel/types.h>
+#include <kernel/waitable.h>
 #include <mem/block.h>
 #include <mem/ptr.h>
 
@@ -33,10 +33,13 @@
 #include <string>
 
 struct ThreadState;
-using ThreadStatePtr = std::shared_ptr<ThreadState>;
+using ThreadStateRef = Ref<ThreadState>;
 struct KernelState;
 class Callback;
-using CallbackPtr = std::shared_ptr<Callback>;
+using CallbackRef = Ref<Callback>;
+class EventFlag;
+class Mutex;
+class RWLock;
 
 // Values are what sceKernelGetThreadInfo reports
 enum class ThreadStatus : SceUInt32 {
@@ -47,9 +50,25 @@ enum class ThreadStatus : SceUInt32 {
     suspended = SCE_KERNEL_THREAD_STATUS_SUSPENDED, // Held by a ForVM suspend, only reported
 };
 
-// A thread, which its end waiters wait on like on any waitable object. Lock order: the object's lock,
-// which guards the end waiters, then thread_mutex, then the thread_mutex of an end waiter it wakes.
-struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> {
+// A thread, which its end waiters wait on like on any waitable object, and which is itself linked
+// in the wait queue of what it waits on. Lock order: the object's lock, which guards the end
+// waiters, then thread_mutex, then the thread_mutex of an end waiter it wakes.
+// Where a thread's display waits count from: the vblank count its last display wait ended on, one
+// for each depth of display waits inside callbacks
+struct DisplayWaitBases {
+    uint64_t bases[7] = {};
+    // How many of the thread's display waits are going on
+    uint32_t depth = 0;
+};
+
+struct ThreadState final : public WithUidClass<Waitable, UidClass::thread>, public IntrusiveLink<ThreadState> {
+private:
+    friend class Ref<ThreadState>;
+
+    // A dormant thread with its stack and TLS, which runs on cpu
+    ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr);
+
+public:
     // Fixed when the thread is created
     const SceUID id;
     const Address entry_point;
@@ -66,8 +85,16 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     const int init_priority;
     const SceInt32 init_affinity_mask;
 
-    // A dormant thread with its stack and TLS, which runs on cpu
-    ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr);
+    // A thread only goes away once its end gave back what it held
+    ~ThreadState() override;
+
+    // The thread's current wait, guarded by the lock of the object it waits on
+    // What it asked for, which the wakers read. Only queueing the thread sets it.
+    const WaitRequest &wait_request() const { return request; }
+    // Its priority when it was queued, the queue is not reordered if it changes
+    int queued_priority = 0;
+    // The result given by whoever ended the queued wait, apart from the wake token wait_result
+    std::optional<SceInt32> ender_result;
 
     // Lifecycle
     // Starts a dormant thread at entry_point.
@@ -117,7 +144,7 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     SceInt32 send_signal();
     // Blocks waiter until this thread becomes dormant or deleted, then writes its exit status to
     // exit_status. The time left is written back to timeout after every sleep.
-    [[nodiscard]] SceInt32 wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, SceUInt32 *timeout, bool callbacks);
+    [[nodiscard]] SceInt32 wait_for_thread_end(ThreadState &waiter, SceInt32 *exit_status, SceUInt32 *timeout, bool callbacks);
     // sleep(), but a callback already pending ends a wait with callbacks at once with NOTIFY_CALLBACK,
     // and the caller then runs it with run_callbacks(). A stale wake can end it early, so callers must
     // recheck their condition.
@@ -140,24 +167,34 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     private:
         ThreadState &thread;
     };
-    // The vblank a display wait for vcount vblanks ends on: vcount after the one the thread's last
-    // display wait ended on, and at least next_vblank. The next display wait counts from it.
-    uint64_t next_display_wait(uint64_t next_vblank, int vcount);
+    // Only the thread itself touches it
+    DisplayWaitBases display_waits;
 
     // Callbacks this thread created
-    // Notifies cb directly with arg and wakes a wait with callbacks
-    void notify_callback(Callback &cb, SceInt32 arg);
+    // Lists cb, which this thread creates, under a new UID and returns the UID
+    SceUID add_callback(CallbackRef cb);
+    // Notifies cb with arg from notifier_id and wakes a wait with callbacks, or returns false if cb
+    // is closed
+    bool notify_callback(Callback &cb, SceInt32 arg, SceUID notifier_id);
     // Drops cb's pending notifications
     void cancel_callback(Callback &cb);
     // cb's pending notifications
     Callback::Notification callback_notifications(const Callback &cb);
-    // Deletes cb for deleter, or returns false if it was deleted already. A run of it going on keeps
-    // its UID until the run ends.
-    bool delete_callback(Callback &cb, SceUID deleter);
+    // Deletes cb, or returns false if it was deleted already. A run of it going on keeps its UID
+    // until the run ends.
+    bool delete_callback(Callback &cb);
     // Runs the notified callbacks of this thread and returns how many ran. Called by the thread itself.
     SceUInt32 process_callbacks();
     // Returns whether a callback of this thread was notified since its last callback pass
     bool has_pending_callbacks();
+
+    // What the thread holds, which its end gives back. Called with the object's lock held.
+    void add_held(Ref<EventFlag> flag);
+    void remove_held(EventFlag &flag);
+    void add_held(Ref<Mutex> mutex);
+    void remove_held(Mutex &mutex);
+    void add_held(Ref<RWLock> rwlock);
+    void remove_held(RWLock &rwlock);
 
     // Thread event handlers
     // Whether the thread runs its thread event handlers.
@@ -190,6 +227,10 @@ struct ThreadState final : public WithUidClass<SyncPrimitive, UidClass::thread> 
     SceInt32 get_vm_context(CPUContext &context, bool &in_kernel_call);
 
 private:
+    friend class WaitQueue;
+
+    WaitRequest request;
+
     // How a thread ends, each value stronger than the ones before it
     enum class Ending : uint8_t {
         none,
@@ -199,11 +240,6 @@ private:
         exit_delete,
         // The host thread ends without running the end handler
         remove,
-    };
-
-    struct EndWaitEntry {
-        // Where to write the exit status, or null
-        SceInt32 *exit_status;
     };
 
     // The private methods are called with thread_mutex held, unless they say otherwise
@@ -226,7 +262,7 @@ private:
     void request_ending(Ending how) { set_ending(std::max(ending, how)); }
     // Whether the thread's current wait has a result or the thread is ending. With thread_mutex held.
     bool wait_over() const { return exiting() || wait_result.has_value(); }
-    // Sleeps on target until wake(), a callback notify during the sleep if target.callbacks, the
+    // Sleeps on target until wake(), a callback notify during the sleep if target has the callback bit, the
     // deadline, or the thread's exit or delete (THREAD_STOPPED), with thread_mutex held through lock.
     [[nodiscard]] SceInt32 sleep(std::unique_lock<std::mutex> &lock, WaitTarget target, Deadline deadline);
 
@@ -246,6 +282,8 @@ private:
     bool finish_run(std::unique_lock<std::mutex> &lock);
     // Calls the guest's data abort handler with the abort context on the stack, without thread_mutex held
     void dispatch_abort(Address fault_addr);
+    // Unlists cb and removes its UID, with thread_mutex held
+    void close_callback(Callback &cb);
     // Runs the thread's event handlers for type in registration order, releasing thread_mutex
     // through lock while they run
     void run_event_handlers(std::unique_lock<std::mutex> &lock, SceUInt32 type);
@@ -289,14 +327,20 @@ private:
     std::optional<SceInt32> wait_result;
     // A sceKernelSendSignal is pending for this thread.
     bool signal_pending = false;
-    // The vblank the thread's last display wait ended on
-    uint64_t last_vblank_waited = 0;
 
     // Callbacks
     // A callback of this thread was notified since the start of the last callback pass
     bool callback_pending = false;
     // The callback runs going on, nested ones too
     int callback_depth = 0;
+    // The thread's callbacks in creation order, including one whose delete is in progress
+    RefList<Callback> callbacks;
+
+    // What the thread holds, each list in the order it took them: its event flag holds, its heavy
+    // mutexes and its write locks
+    RefList<EventFlag> held_flags;
+    RefList<Mutex> held_mutexes;
+    RefList<RWLock> held_rwlocks;
 
     // ForVM suspend
     // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet
@@ -314,7 +358,24 @@ private:
     bool parked = false;
     // Blocked in a host wait inside an export
     bool host_waiting = false;
-
-    // Threads blocked in sceKernelWaitThreadEnd on this one, guarded by the object's lock
-    WaitQueue<EndWaitEntry> end_waiters;
 };
+
+ThreadState *WaitQueue::find_if(std::predicate<ThreadState &> auto pick) {
+    for (ThreadState &thread : threads) {
+        if (pick(thread))
+            return &thread;
+    }
+    return nullptr;
+}
+
+std::size_t WaitQueue::wake_if(std::predicate<ThreadState &> auto pick, SceInt32 result) {
+    std::size_t woken = 0;
+    for (auto it = threads.begin(); it != threads.end();) {
+        ThreadState &thread = *it++;
+        if (!pick(thread))
+            continue;
+        wake(thread, result);
+        ++woken;
+    }
+    return woken;
+}

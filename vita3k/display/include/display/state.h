@@ -17,23 +17,18 @@
 
 #pragma once
 
-#include <kernel/thread/wait_queue.h>
+#include <kernel/types.h>
 #include <mem/ptr.h>
 #include <util/types.h>
 
 #include <atomic>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <thread>
 #include <vector>
 
 enum SceDisplayPixelFormat {
     SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 = 0x00000000U
-};
-
-struct VBlankWaitEntry {
-    uint64_t target_vcount;
 };
 
 struct DisplayFrameInfo {
@@ -47,6 +42,8 @@ struct PredictedDisplayFrame {
     DisplayFrameInfo frame_info;
     Address sync_object;
 };
+
+struct KernelState;
 
 struct DisplayState {
     int viewport_drawable_w = 0;
@@ -63,16 +60,15 @@ struct DisplayState {
     // the next frame which will actually be displayed by the renderer
     DisplayFrameInfo next_rendered_frame;
 
-    std::mutex mutex;
     std::unique_ptr<std::thread> vblank_thread;
     std::atomic<bool> abort{ false };
     std::atomic<bool> imgui_render{ true };
     std::atomic<bool> fullscreen{ false };
     std::atomic<std::uint64_t> vblank_count{ 0 };
-    WaitQueue<VBlankWaitEntry> vblank_waiters;
+    // The UID of the kernel's event pulsed at each vblank, which the display waits wait on and the
+    // vblank start callbacks are registered to
+    SceUID vblank_event = 0;
     std::atomic<uint64_t> last_setframe_vblank_count = 0;
-    // The UIDs of the callbacks to notify at each vblank start
-    std::set<SceUID> vblank_callbacks{};
 
     // if set to true, make sceDisplayWaitVblankStartMulti/sceDisplayWaitSetFrameBufMulti behave as sceDisplayWaitVblankStart/sceDisplayWaitSetFrameBuf
     // this allows some game running at 30fps to run at 60fps without any issue
@@ -91,5 +87,5 @@ struct DisplayState {
 
     std::atomic<Address> current_sync_object;
 
-    void deinit();
+    void deinit(KernelState &kernel);
 };
