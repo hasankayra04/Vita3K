@@ -190,6 +190,8 @@ display_framebuf_blocks         fail     # no framebuffer base alignment check
 display_framebuf_free           skip     # whether the renderer crashes on a freed framebuffer depends on timing
 display_framebuf_set_freed      skip     # a framebuffer where a block was freed is taken, whether the renderer crashes on it depends on timing
 display_setframebuf_cb_notify   pass
+display_setframebuf_cb_passed_target pass
+display_vblank_callback_registered_twice pass
 display_vblank_cb_display_callback pass
 display_vblank_cb_inner_sema    pass
 display_vblank_cb_inner_wait    pass
@@ -413,6 +415,7 @@ msgpipe_event_before_callbacks  fail     # a pipe isn't an event
 msgpipe_failed_sizes            pass
 msgpipe_info_event_waiter       fail     # a pipe isn't an event, and its info has no waiter attribute bit
 msgpipe_mixed_queue             fail     # a pipe isn't an event, and its info has no waiter attribute bit
+msgpipe_mixed_sides_sender_order fail     # a send to two waiting DONT_REMOVE receives completes only the first
 msgpipe_modes                   pass
 msgpipe_open_close_bits         fail     # a pipe isn't an event, and an opened UID doesn't keep the pipe alive after the creating UID's delete
 msgpipe_order                   pass
@@ -756,9 +759,9 @@ timeout_threshold               skip     # timing, which short timeouts end at o
 timeouts                        pass
 timer                           pass
 timer_base_remaining            pass
-timer_callback                  fail     # a timer's events reach its registered callbacks only when something reads the timer, there is no timer service
+timer_callback                  pass
 timer_callback_lifecycle_args   fail     # a timer's open and close don't notify its registered callbacks
-timer_callback_other_wait       fail     # a timer's events reach its registered callbacks only when something reads the timer, there is no timer service
+timer_callback_other_wait       pass
 timer_cancel_clear_valid        fail     # timer cancel and clear leave the waiter results and the waiting count wrong
 timer_cancel_with_set_pattern   fail     # event calls don't take timer UIDs
 timer_clear_mask_pattern        pass
@@ -782,6 +785,7 @@ timer_repeat_argument_values    pass
 timer_repeat_auto_reset_missed  skip     # whether the second poll sees the next fire depends on how busy the host is between the polls
 timer_repeat_info_steps         pass
 timer_repeat_pulse_vs_set       pass
+timer_repeat_wrapping_interval  pass
 timer_requeue                   fail     # no requeue on a priority change
 timer_reset_event_running       pass
 timer_set_time_moves_event      pass
