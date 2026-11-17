@@ -170,12 +170,14 @@ Event::Event(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUInt64
 SimpleEvent::SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUID creator)
     : WithUidClass(attr, name, init_pattern, system_event_user_data(creator)) {}
 
-SceInt32 SimpleEvent::check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern) {
+SceInt32 SimpleEvent::check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern, const SceKernelSimpleEventOptParam *opt) {
     if (const SceInt32 error = check_name(name, attr))
         return error;
     // The notify attribute is accepted and reported, nothing reads it
     if (attr & ~(SCE_KERNEL_EVENT_ATTR_AUTO_RESET | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE | SCE_KERNEL_ATTR_NOTIFY_CB_WAKEUP_ONLY))
         return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+    if (opt && opt->size > sizeof(*opt))
+        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
     if (init_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
         return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
     return SCE_KERNEL_OK;
@@ -290,7 +292,7 @@ SceInt32 Event::poll(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt6
     return try_take(wait_pattern, result_pattern, user_data);
 }
 
-SceInt32 SimpleEvent::set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set) {
+SceInt32 Event::set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set) {
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
@@ -301,7 +303,7 @@ SceInt32 SimpleEvent::set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, b
     return SCE_KERNEL_OK;
 }
 
-SceInt32 SimpleEvent::set_or_pulse_and_notify(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set, SceInt32 notify_arg) {
+SceInt32 Event::set_or_pulse_and_notify(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set, SceInt32 notify_arg) {
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
@@ -324,7 +326,7 @@ void SimpleEvent::pulse_and_notify(SceUInt32 pattern, SceInt32 notify_arg) {
     notify_callbacks(notify_arg);
 }
 
-SceInt32 SimpleEvent::set_system_event(SceUInt32 event, SceUInt64 user_data) {
+SceInt32 Event::set_system_event(SceUInt32 event, SceUInt64 user_data) {
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
@@ -446,6 +448,14 @@ inline uint64_t timer_clock() {
 Timer::Timer(TimerService &timers, SceUInt32 attr, const char *name, SceUID creator)
     : WithUidClass(attr, name, 0, system_event_user_data(creator))
     , timers(timers) {}
+
+SceInt32 Timer::check_create(const char *name, SceUInt32 attr) {
+    if (const SceInt32 error = check_name(name, attr))
+        return error;
+    if (attr & ~(SCE_KERNEL_EVENT_ATTR_AUTO_RESET | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE | SCE_KERNEL_ATTR_NOTIFY_CB_WAKEUP_ONLY))
+        return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+    return SCE_KERNEL_OK;
+}
 
 // Minimum time until the worker starts its next batch.
 constexpr uint64_t TIMER_EVENT_FLOOR = 200;
@@ -812,6 +822,11 @@ SceInt32 Mutex::try_take(MemState &mem, ThreadState &thread, SceInt32 count) {
     return SCE_KERNEL_OK;
 }
 
+void Mutex::count_failed_take(MemState &mem) {
+    if (lightweight())
+        ++workarea.get(mem)->waitCount;
+}
+
 void Mutex::update_workarea(MemState &mem) {
     if (!lightweight())
         return;
@@ -842,6 +857,7 @@ SceInt32 Mutex::acquire(MemState &mem, ThreadState &thread, SceInt32 count, SceU
             r = try_take(mem, thread, count);
             break;
         }
+        count_failed_take(mem);
         r = Waitable::wait(guard, thread, type, { .count = count }, deadline, timeout);
         if (r != SCE_KERNEL_ERROR_NOTIFY_CALLBACK) {
             r = finish_wait(guard, thread, callbacks, r);
@@ -873,6 +889,7 @@ SceInt32 Mutex::relock(MemState &mem, ThreadState &thread, bool callbacks) {
             r = try_take(mem, thread, 1);
             break;
         }
+        count_failed_take(mem);
         r = Waitable::wait(guard, thread, type, { .count = 1 }, Deadline::max(), nullptr);
         if (r != SCE_KERNEL_ERROR_NOTIFY_CALLBACK) {
             // Only a delete runs the callbacks notified during the wait
@@ -910,9 +927,13 @@ SceInt32 Mutex::release(MemState &mem, ThreadState &thread, SceInt32 unlock_coun
         return lightweight() ? SCE_KERNEL_ERROR_LW_MUTEX_UNLOCK_UDF : SCE_KERNEL_ERROR_MUTEX_UNLOCK_UDF;
 
     lock_count -= unlock_count;
-    if (lock_count == 0)
+    if (lock_count == 0) {
         clear_owner();
-    serve();
+        serve();
+        // A hand over leaves the number of the other waiters as a lightweight mutex's wait count
+        if (owner && lightweight())
+            workarea.get(mem)->waitCount = static_cast<std::uint32_t>(waiters.size());
+    }
     update_workarea(mem);
 
     return SCE_KERNEL_OK;
@@ -957,6 +978,18 @@ SceInt32 Mutex::cancel(ThreadState &thread, SceInt32 new_count, SceUInt32 *num_w
     if (num_wait_threads)
         *num_wait_threads = nb_threads;
 
+    return SCE_KERNEL_OK;
+}
+
+SceInt32 LwMutex::check_create(const char *name, SceUInt32 attr, SceInt32 init_count, const SceKernelLwMutexOptParam *opt) {
+    if (attr & ~(SCE_KERNEL_MUTEX_ATTR_RECURSIVE | SCE_KERNEL_ATTR_TH_PRIO))
+        return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+    if (opt && opt->size > sizeof(*opt))
+        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
+    if (init_count < 0 || (init_count > 1 && !(attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE)))
+        return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+    if (!name)
+        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
     return SCE_KERNEL_OK;
 }
 
@@ -1218,13 +1251,15 @@ Semaphore::Semaphore(SceUInt32 attr, const char *name, SceInt32 init_val, SceInt
     , max(max_val)
     , val(init_val) {}
 
-SceInt32 Semaphore::check_create(const char *name, SceUInt32 attr, SceInt32 init_val, SceInt32 max_val) {
+SceInt32 Semaphore::check_create(const char *name, SceUInt32 attr, SceInt32 init_val, SceInt32 max_val, const SceKernelSemaOptParam *opt) {
     if (const SceInt32 error = check_name(name, attr))
         return error;
     if (attr & ~(SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE))
         return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
     if (init_val < 0 || max_val <= 0 || init_val > max_val)
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+    if (opt && opt->size > sizeof(*opt))
+        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
     return SCE_KERNEL_OK;
 }
 
@@ -1236,7 +1271,7 @@ SceInt32 Semaphore::wait(ThreadState &thread, SceInt32 need_count, SceUInt32 *ti
     auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID;
-    if (need_count <= 0 || need_count > max)
+    if (need_count > max)
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
 
     const SceUInt32 type = wait_type(SCE_KERNEL_WAITTYPE_SEMAPHORE, callbacks);
@@ -1256,7 +1291,7 @@ SceInt32 Semaphore::poll(ThreadState &thread, SceInt32 need_count) {
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID;
-    if (need_count <= 0 || need_count > max)
+    if (need_count > max)
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
 
     return try_take(thread, need_count) ? SCE_KERNEL_OK : SCE_KERNEL_ERROR_SEMA_ZERO;
@@ -1275,8 +1310,6 @@ SceInt32 Semaphore::signal(SceInt32 count) {
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID;
 
-    if (count < 0)
-        return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
     if (count > max - val) {
         return SCE_KERNEL_ERROR_SEMA_OVF;
     }
@@ -1337,6 +1370,14 @@ SceInt32 Semaphore::info(SceKernelSemaInfo &info) const {
 Condvar::Condvar(SceUInt32 attr, const char *name, MutexRef associated_mutex)
     : Waitable(attr, name)
     , associated_mutex(std::move(associated_mutex)) {}
+
+SceInt32 Condvar::check_create(const char *name, SceUInt32 attr) {
+    if (!name)
+        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+    if (attr & ~SCE_KERNEL_ATTR_TH_PRIO)
+        return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+    return SCE_KERNEL_OK;
+}
 
 void Condvar::end_waits(SceUID) {
     // wait() maps this to the condition's own delete error
@@ -1461,17 +1502,17 @@ EventFlag::EventFlag(SceUInt32 attr, const char *name, SceUInt32 init_pattern)
     , init_pattern(init_pattern)
     , flags(init_pattern) {}
 
-SceInt32 EventFlag::check_create(const char *name, SceUInt32 attr) {
+SceInt32 EventFlag::check_create(const char *name, SceUInt32 attr, const SceKernelEventFlagOptParam *opt) {
     if (const SceInt32 error = check_name(name, attr))
         return error;
     if (attr & ~(SCE_EVENT_WAITMULTIPLE | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE))
         return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+    if (opt && opt->size > sizeof(*opt))
+        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
     return SCE_KERNEL_OK;
 }
 
-SceInt32 EventFlag::check_wait(SceUInt32 pattern, SceUInt32 wait_mode) {
-    if (pattern == 0)
-        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+SceInt32 EventFlag::check_mode(SceUInt32 wait_mode) {
     if (wait_mode & ~(SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR | SCE_EVENT_WAITCLEAR_PAT))
         return SCE_KERNEL_ERROR_ILLEGAL_MODE;
     // Only one way of clearing the bits after the wait
@@ -1549,8 +1590,11 @@ SceInt32 EventFlag::wait(ThreadState &thread, SceUInt32 pattern, SceUInt32 wait_
     auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_EVF_ID;
-    if (const SceInt32 error = check_wait(pattern, wait_mode))
+    // A wait checks the mode before the pattern, a poll the other way round
+    if (const SceInt32 error = check_mode(wait_mode))
         return error;
+    if (pattern == 0)
+        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     if (held_by_other(thread.id))
         return SCE_KERNEL_ERROR_EVF_MULTI;
 
@@ -1587,7 +1631,9 @@ SceInt32 EventFlag::poll(SceUID thread_id, SceUInt32 pattern, SceUInt32 wait_mod
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_EVF_ID;
-    if (const SceInt32 error = check_wait(pattern, wait_mode))
+    if (pattern == 0)
+        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+    if (const SceInt32 error = check_mode(wait_mode))
         return error;
 
     return try_take(thread_id, pattern, wait_mode, out_bits);
@@ -1700,11 +1746,6 @@ SceInt32 MsgPipe::check_create(const char *name, SceUInt32 type, SceUInt32 attr,
     return SCE_KERNEL_OK;
 }
 
-// Returns whether a send or receive takes this wait mode
-static bool is_msg_pipe_mode(SceUInt32 wait_mode) {
-    return !(wait_mode & ~(SCE_KERNEL_MSG_PIPE_MODE_FULL | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT | SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE));
-}
-
 void MsgPipe::end_waits(SceUID deleter) {
     write_pos = 0;
     read_pos = 0;
@@ -1779,12 +1820,18 @@ SceInt32 MsgPipe::transfer_result(SceInt32 result, const MsgPipeTransfer &transf
     return result;
 }
 
-// The size of all the pieces together
-static uint64_t total_size(std::span<const MsgPipeVector> pieces) {
+std::expected<SceSize, SceInt32> MsgPipe::check_pieces(std::span<const MsgPipeVector> pieces) const {
+    // Each piece is read once, so the total the transfer uses is the one checked here
     uint64_t total = 0;
-    for (const MsgPipeVector &piece : pieces)
+    for (const MsgPipeVector &piece : pieces) {
+        // Even an empty piece needs a buffer
+        if (!piece.base)
+            return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
         total += piece.size;
-    return total;
+        if (total > capacity)
+            return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+    }
+    return static_cast<SceSize>(total);
 }
 
 MsgPipeTransfer::MsgPipeTransfer(MemState &mem, std::span<const MsgPipeVector> pieces, SceSize *size, SceSize total, bool full)
@@ -1980,8 +2027,6 @@ bool MsgPipe::goes_first(const WaitRequest &request, int priority) {
 }
 
 SceInt32 MsgPipe::receive(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceSize *size, SceUInt32 *timeout, bool callbacks) {
-    if (!is_msg_pipe_mode(wait_mode))
-        return SCE_KERNEL_ERROR_ILLEGAL_MODE;
     // DONT_WAIT ends like a try, and a wait with callbacks runs them after it
     if (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT) {
         const SceInt32 result = try_receive(thread, mem, wait_mode, pieces, size);
@@ -1989,14 +2034,13 @@ SceInt32 MsgPipe::receive(ThreadState &thread, MemState &mem, SceUInt32 wait_mod
             thread.process_callbacks();
         return result;
     }
-    const uint64_t total = total_size(pieces);
-    if (total > capacity)
-        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
-
     auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID;
-    MsgPipeReceiver receiver(mem, pieces, size, static_cast<SceSize>(total), wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE);
+    const std::expected<SceSize, SceInt32> total = check_pieces(pieces);
+    if (!total)
+        return total.error();
+    MsgPipeReceiver receiver(mem, pieces, size, *total, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE);
     // A receive of nothing ends at once, before any callback runs
     if (receiver.total == 0) {
         receiver.report();
@@ -2026,8 +2070,6 @@ SceInt32 MsgPipe::receive(ThreadState &thread, MemState &mem, SceUInt32 wait_mod
 }
 
 SceInt32 MsgPipe::send(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceSize *size, SceUInt32 *timeout, bool callbacks) {
-    if (!is_msg_pipe_mode(wait_mode))
-        return SCE_KERNEL_ERROR_ILLEGAL_MODE;
     // DONT_WAIT ends like a try, and a wait with callbacks runs them after it
     if (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT) {
         const SceInt32 result = try_send(thread, mem, wait_mode, pieces, size);
@@ -2035,14 +2077,13 @@ SceInt32 MsgPipe::send(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, 
             thread.process_callbacks();
         return result;
     }
-    const uint64_t total = total_size(pieces);
-    if (total > capacity)
-        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
-
     auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID;
-    MsgPipeSender sender(mem, pieces, size, static_cast<SceSize>(total), wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
+    const std::expected<SceSize, SceInt32> total = check_pieces(pieces);
+    if (!total)
+        return total.error();
+    MsgPipeSender sender(mem, pieces, size, *total, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
     // A send of nothing ends at once, before any callback runs
     if (sender.total == 0) {
         sender.report();
@@ -2069,16 +2110,13 @@ SceInt32 MsgPipe::send(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, 
 }
 
 SceInt32 MsgPipe::try_receive(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceSize *size) {
-    if (!is_msg_pipe_mode(wait_mode))
-        return SCE_KERNEL_ERROR_ILLEGAL_MODE;
-    const uint64_t total = total_size(pieces);
-    if (total > capacity)
-        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
-
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID;
-    MsgPipeReceiver receiver(mem, pieces, size, static_cast<SceSize>(total), wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE);
+    const std::expected<SceSize, SceInt32> total = check_pieces(pieces);
+    if (!total)
+        return total.error();
+    MsgPipeReceiver receiver(mem, pieces, size, *total, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE);
     // Behind the receivers already waiting, or short of bytes for all of a FULL receive, it fails
     // without writing a size
     if (!goes_first({ .receiver = &receiver }, thread.get_priority()) || (receiver.full && receiver.total > available()))
@@ -2087,16 +2125,13 @@ SceInt32 MsgPipe::try_receive(ThreadState &thread, MemState &mem, SceUInt32 wait
 }
 
 SceInt32 MsgPipe::try_send(ThreadState &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceSize *size) {
-    if (!is_msg_pipe_mode(wait_mode))
-        return SCE_KERNEL_ERROR_ILLEGAL_MODE;
-    const uint64_t total = total_size(pieces);
-    if (total > capacity)
-        return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
-
     const auto guard = lock();
     if (!guard)
         return SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID;
-    MsgPipeSender sender(mem, pieces, size, static_cast<SceSize>(total), wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
+    const std::expected<SceSize, SceInt32> total = check_pieces(pieces);
+    if (!total)
+        return total.error();
+    MsgPipeSender sender(mem, pieces, size, *total, wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
     // Behind the senders already waiting, or short of room for all of a FULL send, it fails without
     // writing a size
     if (!goes_first({ .sender = &sender }, thread.get_priority()) || (sender.full && sender.total > capacity - held))

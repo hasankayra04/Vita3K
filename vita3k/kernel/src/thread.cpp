@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <cpu/arm.h>
 #include <cpu/state.h>
 #include <kernel/thread/thread_state.h>
 
@@ -30,6 +31,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
 
 // The priority a thread created with priority runs at. The default range stands for the game's own.
@@ -45,19 +47,20 @@ static int created_priority(int priority) {
 static CPUContext initial_context(Address stack_top) {
     CPUContext ctx;
     // A Vita starts every thread with these in r2 to r12, and some games rely on r9 not being 0
-    std::fill(ctx.cpu_registers.begin() + 2, ctx.cpu_registers.begin() + 13, 0xDEADBEEF);
+    std::fill(ctx.cpu_registers.begin() + 2, ctx.cpu_registers.begin() + arm::REG_SP, 0xDEADBEEF);
     ctx.set_sp(stack_top);
+    ctx.cpsr = SCE_KERNEL_THREAD_INITIAL_CPSR;
     ctx.fpscr = SCE_KERNEL_THREAD_INITIAL_FPSCR;
     return ctx;
 }
 
 // Puts the fill value in the d registers the kernel doesn't keep when it resumes a thread
 static void fill_unkept_vfp(CPUContext &ctx) {
-    for (std::size_t d = 0; d < 32; d++) {
-        if (d == 2 || d == 3 || (d >= 8 && d <= 15))
+    for (uint32_t d = 0; d < arm::D_REG_COUNT; d++) {
+        if (d == 2 || d == 3 || (d >= arm::AAPCS_VFP_CALLEE_SAVED_FIRST_D && d <= arm::AAPCS_VFP_CALLEE_SAVED_LAST_D))
             continue;
-        ctx.fpu_registers[2 * d] = std::bit_cast<float>(SCE_KERNEL_VFP_REGISTER_FILL_LOW);
-        ctx.fpu_registers[2 * d + 1] = std::bit_cast<float>(SCE_KERNEL_VFP_REGISTER_FILL_HIGH);
+        ctx.fpu_registers[arm::WORDS_PER_D_REG * d] = std::bit_cast<float>(SCE_KERNEL_VFP_REGISTER_FILL_LOW);
+        ctx.fpu_registers[arm::WORDS_PER_D_REG * d + 1] = std::bit_cast<float>(SCE_KERNEL_VFP_REGISTER_FILL_HIGH);
     }
 }
 
@@ -83,10 +86,9 @@ ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUState
     tls_slot(TLS_THREAD_ID) = id;
     tls_slot(TLS_SP_TOP) = stack.get() + this->stack_size;
     tls_slot(TLS_SP_BOTTOM) = stack.get();
-    // A Vita starts every thread with a different random value in each of these. These are the
-    // values one thread had on a PS Vita TV, the same for every thread so runs repeat.
-    tls_slot(TLS_RESERVED_6) = static_cast<int>(0xFEFA7314);
-    tls_slot(TLS_STACK_CHECK_GUARD) = static_cast<int>(0xC325C2A7);
+    // The console gives each thread a word from its MT19937. One fixed word keeps runs repeatable.
+    tls_slot(TLS_JMPBUF_KEY) = static_cast<int>(0xFEFA7314);
+    tls_slot(TLS_STACK_CHECK_GUARD) = static_cast<int>(KernelState::STACK_CHECK_GUARD);
     tls_slot(TLS_CURRENT_PRIORITY) = priority;
     tls_slot(TLS_CPU_AFFINITY_MASK) = affinity_mask;
 
@@ -108,6 +110,24 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
         return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
     if (status != ThreadStatus::dormant)
         return SCE_KERNEL_ERROR_NOT_DORMANT;
+    if (arglen > stack_size)
+        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+    // A thread starts with TPIDRURW at 0, also when it starts again
+    CPUContext ctx = initial_context(stack.get() + stack_size);
+    // The entry gets the size of the argument data and its copy on the stack, or 0 and null for none
+    Address data_addr = 0;
+    if (argp && arglen > 0) {
+        data_addr = ctx.get_sp() - align(arglen, 16);
+        ctx.set_sp(data_addr);
+        memcpy(Ptr<uint8_t>(data_addr).get(mem), argp.get(mem), arglen);
+    } else {
+        arglen = 0;
+    }
+    begin_run(ctx, { arglen, data_addr }, run_entry_callback);
+    return SCE_KERNEL_OK;
+}
+
+void ThreadState::begin_run(CPUContext ctx, std::initializer_list<uint32_t> args, bool run_entry_callback) {
     assert(held_flags.empty() && held_mutexes.empty() && held_rwlocks.empty());
     run_start_callback = run_entry_callback;
     returned_value = SCE_KERNEL_ERROR_NOT_DORMANT;
@@ -116,28 +136,18 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
         last_cpu = 0;
         change_cpu_count = 0;
     }
-    // A start clears a callback notification the thread's last run left, which its end keeps
+    // A start clears a callback notification and a signal left from before, which its end keeps
     callback_pending = false;
+    signal_pending = false;
     // Each run starts at the priority and on the cores the thread was created with, and its TLS
     // shows them
     priority = init_priority;
     affinity_mask = init_affinity_mask;
     tls_slot(TLS_CURRENT_PRIORITY) = priority;
     tls_slot(TLS_CPU_AFFINITY_MASK) = affinity_mask;
-    // A thread starts with TPIDRURW at 0, also when it starts again
-    CPUContext ctx = initial_context(stack.get() + stack_size);
-    // The entry gets the size of the argument data and its copy on the stack, or null for none
-    Address data_addr = 0;
-    if (argp && arglen > 0) {
-        data_addr = ctx.get_sp() - align(arglen, 8);
-        ctx.set_sp(data_addr);
-        memcpy(Ptr<uint8_t>(data_addr).get(mem), argp.get(mem), arglen);
-    }
-    ctx.place_call(mem, entry_point, cpu->return_pc, { arglen, data_addr });
+    ctx.place_call(mem, entry_point, cpu->return_pc, args);
     cpu->set_context(ctx);
-
     update_status(ThreadStatus::running);
-    return SCE_KERNEL_OK;
 }
 
 void ThreadState::exit(SceInt32 status) {
@@ -203,6 +213,8 @@ void ThreadState::run_loop() {
         // A thread that returns from its entry ends like one that exits, end handler included
         if (const std::optional<uint32_t> returned = run_guest(lock, false)) {
             returned_value = *returned;
+            // The return lands in libkernel's exit stub, which pushes two words before its exit call
+            cpu->stack_alloc(8);
             request_ending(Ending::exit);
         }
     } while (finish_run(lock));
@@ -348,7 +360,7 @@ std::optional<uint32_t> ThreadState::call_guest(Address fn, std::initializer_lis
     CPUContext ctx = cpu->get_context();
     ctx.set_sp(caller.get_sp());
     ctx.set_lr(caller.get_lr());
-    ctx.set_pc(caller.get_pc() | caller.thumb());
+    ctx.set_pc(caller.get_pc() | (caller.thumb() ? arm::THUMB_BIT : 0));
     ctx.cpsr = caller.cpsr;
     cpu->set_context(ctx);
     return returned;
@@ -386,18 +398,18 @@ void ThreadState::dispatch_abort(Address fault_addr) {
     // instruction, so the call is only a notification and nothing is restored from the context.
     const uint32_t ctx_size = 17 * 4;
     const uint32_t sp_orig = cpu.get_sp();
-    const uint32_t sp_aligned = align_down(sp_orig - ctx_size, 8);
+    const uint32_t sp_aligned = align_down(sp_orig - ctx_size, arm::AAPCS_STACK_ALIGN);
 
     auto *ctx = Ptr<uint32_t>(sp_aligned).get(cpu.mem);
-    for (int i = 0; i < 13; i++)
+    for (uint32_t i = 0; i < arm::REG_SP; i++)
         ctx[i] = cpu.get_reg(i);
-    ctx[13] = sp_aligned + ctx_size;
-    ctx[14] = cpu.get_lr();
-    ctx[15] = cpu.get_pc();
+    ctx[arm::REG_SP] = sp_aligned + ctx_size;
+    ctx[arm::REG_LR] = cpu.get_lr();
+    ctx[arm::REG_PC] = cpu.get_pc();
     ctx[16] = fault_addr;
 
     LOG_DEBUG("DABT handler=0x{:08X} FAR=0x{:08X} PC=0x{:08X} SP=0x{:08X} sp_aligned=0x{:08X}",
-        handler, fault_addr, ctx[15], sp_orig, sp_aligned);
+        handler, fault_addr, ctx[arm::REG_PC], sp_orig, sp_aligned);
 
     // The handler interrupts guest code, which goes on with all its registers
     const CPUContext interrupted = cpu.get_context();
@@ -406,8 +418,19 @@ void ThreadState::dispatch_abort(Address fault_addr) {
 }
 
 uint32_t ThreadState::start_and_wait(SceSize args, const Ptr<void> argp) {
-    start(args, argp);
+    // A refused start leaves the thread dormant, so its error is the result
+    if (const int error = start(args, argp))
+        return error;
     std::unique_lock<std::mutex> lock(thread_mutex);
+    cv.wait(lock, [&] { return status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
+    return returned_value;
+}
+
+uint32_t ThreadState::call_and_wait(Address arg) {
+    std::unique_lock<std::mutex> lock(thread_mutex);
+    if (status != ThreadStatus::dormant)
+        return SCE_KERNEL_ERROR_NOT_DORMANT;
+    begin_run(initial_context(stack.get() + stack_size), { arg }, false);
     cv.wait(lock, [&] { return status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
     return returned_value;
 }
@@ -868,14 +891,62 @@ int ThreadState::vm_resume() {
     return vm_suspend_count;
 }
 
-SceInt32 ThreadState::get_vm_context(CPUContext &context, bool &in_kernel_call) {
-    std::unique_lock<std::mutex> lock(thread_mutex);
+bool ThreadState::wait_vm_stop(std::unique_lock<std::mutex> &lock) {
     // A thread whose wait timed out while suspended stops on its way back to its code
-    cv.wait(lock, [&] { return parked || status != ThreadStatus::running || vm_suspend_count == 0 || exiting(); });
-    if (vm_suspend_count == 0)
+    cv.wait(lock, [&] { return parked || status != ThreadStatus::running || vm_suspend_count == 0; });
+    return vm_suspend_count != 0;
+}
+
+SceInt32 ThreadState::get_vm_context(SceKernelThreadCpuRegisterInfo *cpu_info, SceKernelThreadVfpRegisterInfo *vfp_info) {
+    std::unique_lock<std::mutex> lock(thread_mutex);
+    if (!wait_vm_stop(lock))
         return SCE_KERNEL_ERROR_NOT_SUSPENDED;
-    context = cpu->get_context();
-    // Inside a kernel call means waiting, or held on the way back from one
-    in_kernel_call = status == ThreadStatus::waiting || (parked && stopped_after_kernel_call);
+    const CPUContext context = cpu->get_context();
+    if (cpu_info) {
+        cpu_info->cpsr = context.cpsr;
+        std::ranges::copy(context.cpu_registers, cpu_info->reg);
+        cpu_info->tpidrurw = context.tpidrurw;
+        cpu_info->sb = tls_slot(TLS_SP_TOP);
+        cpu_info->st = tls_slot(TLS_SP_BOTTOM);
+    }
+    if (vfp_info) {
+        if (stopped_in_kernel_call()) {
+            // Inside a kernel call the FPSCR is the one the kernel runs with, and only d8 to d15,
+            // which a call keeps, are the thread's. Every other d register reads this NaN.
+            constexpr uint32_t SCRUBBED[2] = { 0x7F80DEADU, 0x7FF8DEADU };
+            vfp_info->fpscr = SCE_KERNEL_THREAD_INITIAL_FPSCR;
+            for (size_t i = 0; i < std::size(vfp_info->reg); i += arm::WORDS_PER_D_REG)
+                memcpy(&vfp_info->reg[i], SCRUBBED, sizeof(SCRUBBED));
+            std::ranges::copy(std::span(context.fpu_registers).subspan(arm::AAPCS_VFP_CALLEE_SAVED_FIRST_S, arm::AAPCS_VFP_CALLEE_SAVED_S_COUNT), vfp_info->reg + arm::AAPCS_VFP_CALLEE_SAVED_FIRST_S);
+        } else {
+            vfp_info->fpscr = context.fpscr;
+            std::ranges::copy(context.fpu_registers, vfp_info->reg);
+        }
+    }
+    return SCE_KERNEL_OK;
+}
+
+SceInt32 ThreadState::set_vm_context(const SceKernelThreadCpuRegisterInfo *cpu_info, const SceKernelThreadVfpRegisterInfo *vfp_info) {
+    std::unique_lock<std::mutex> lock(thread_mutex);
+    if (!wait_vm_stop(lock))
+        return SCE_KERNEL_ERROR_NOT_SUSPENDED;
+    CPUContext context = cpu->get_context();
+    if (cpu_info) {
+        std::ranges::copy(cpu_info->reg, context.cpu_registers.begin());
+        context.cpsr = (context.cpsr & SCE_KERNEL_VM_CONTEXT_CPSR_KEPT) | (cpu_info->cpsr & ~SCE_KERNEL_VM_CONTEXT_CPSR_KEPT);
+        context.tpidrurw = cpu_info->tpidrurw;
+        tls_slot(TLS_SP_TOP) = static_cast<int>(cpu_info->sb);
+        tls_slot(TLS_SP_BOTTOM) = static_cast<int>(cpu_info->st);
+    }
+    if (vfp_info) {
+        context.fpscr = vfp_info->fpscr;
+        // Inside a kernel call they go to the save area, and the way back to the thread's code
+        // loads only d8 to d15 from it
+        if (stopped_in_kernel_call())
+            std::ranges::copy(std::span(vfp_info->reg).subspan(arm::AAPCS_VFP_CALLEE_SAVED_FIRST_S, arm::AAPCS_VFP_CALLEE_SAVED_S_COUNT), context.fpu_registers.begin() + arm::AAPCS_VFP_CALLEE_SAVED_FIRST_S);
+        else
+            std::ranges::copy(vfp_info->reg, context.fpu_registers.begin());
+    }
+    cpu->set_context(context);
     return SCE_KERNEL_OK;
 }

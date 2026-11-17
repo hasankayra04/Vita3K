@@ -19,6 +19,7 @@
 #include <tracy/Tracy.hpp>
 #endif
 
+#include <cpu/arm.h>
 #include <cpu/common.h>
 #include <kernel/state.h>
 #include <mem/functions.h>
@@ -105,8 +106,8 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     // Generate halt instruction (NOP + WFI)
     halt_instruction = alloc_block(mem, 4, "halt_instruction");
     const auto halt_ptr = halt_instruction.get_ptr<uint16_t>().get(mem);
-    halt_ptr[0] = 0xBF00; // NOP
-    halt_ptr[1] = 0xBF30; // WFI
+    halt_ptr[0] = arm::THUMB_NOP;
+    halt_ptr[1] = arm::THUMB_WFI;
 
     return true;
 }
@@ -173,7 +174,7 @@ ThreadStateRef KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     if (!cpu)
         return nullptr;
     // A guest function the kernel calls returns to the halt instruction, in Thumb mode
-    cpu->return_pc = halt_instruction.get() | 1;
+    cpu->return_pc = halt_instruction.get() | arm::THUMB_BIT;
     cpu->set_log_code(debugger.watch_code);
     cpu->set_log_mem(debugger.watch_memory);
     ThreadStateRef thread = Ref<ThreadState>::make(id, *this, mem, std::move(cpu), name, entry_point.address(), init_priority, affinity_mask, stack_size, attr);
@@ -200,15 +201,12 @@ ThreadStateRef KernelState::create_thread(MemState &mem, const char *name, Ptr<c
 }
 
 Ptr<Ptr<void>> KernelState::get_thread_tls_addr(MemState &mem, SceUID thread_id, int key) {
-    Ptr<Ptr<void>> address(0);
-    // magic numbers taken from decompiled source. There is 0x400 unused bytes of unknown usage
-    if (key <= 0x100 && key >= 0) {
-        const ThreadStateRef thread = get_thread(thread_id);
-        address = thread->tls.get_ptr<Ptr<void>>() + key;
-    } else {
-        LOG_ERROR("Wrong tls slot index. TID:{} index:{}", thread_id, key);
-    }
-    return address;
+    if (key < 0 || key >= SCE_KERNEL_TLS_KEY_COUNT)
+        return Ptr<Ptr<void>>();
+    const ThreadStateRef thread = get_thread(thread_id);
+    if (!thread)
+        return Ptr<Ptr<void>>();
+    return thread->tls.get_ptr<Ptr<void>>() + key;
 }
 
 void KernelState::request_process_exit(int res, std::optional<AppLaunchRequest> relaunch) {

@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #pragma once
+#include <cpu/arm.h>
 #include <mem/ptr.h>
 #include <util/types.h>
 
@@ -57,7 +58,13 @@
 #define SCE_KERNEL_THREAD_ATTR_UNKNOWN_2000 0x00002000U
 
 // The FPSCR a thread starts with: round to nearest, flush-to-zero and default NaN
-#define SCE_KERNEL_THREAD_INITIAL_FPSCR 0x03000000U
+#define SCE_KERNEL_THREAD_INITIAL_FPSCR (arm::FPSCR_DN | arm::FPSCR_FZ)
+
+// The CPSR a thread starts with: user mode and no flags
+#define SCE_KERNEL_THREAD_INITIAL_CPSR arm::CPSR_MODE_USR
+
+// The CPSR bits a ForVM context write keeps. It takes the other bits from the new value.
+#define SCE_KERNEL_VM_CONTEXT_CPSR_KEPT (arm::CPSR_M | arm::CPSR_F | arm::CPSR_I | arm::CPSR_A | arm::CPSR_RESERVED_23_20 | arm::CPSR_IT_1_0)
 
 // The words of the value the kernel puts in the d registers it doesn't keep for a thread
 #define SCE_KERNEL_VFP_REGISTER_FILL_LOW 0x7F80DEADU
@@ -655,21 +662,52 @@ enum SceSysmoduleInternalModuleId : uint32_t {
 // The size of the kernel's part of a thread's TLS, below the part the guest sees
 #define SCE_KERNEL_TLS_SIZE 0x800
 
-// Indexes in thread local storage (TLS) for system data. It is used mostly by libkernel.
+// The number of TLS slots sceKernelGetTLSAddr gives an address for
+#define SCE_KERNEL_TLS_KEY_COUNT 0x100
+
+// Indexes of the words in a thread's TLS area, used by the system and its libraries
 enum TlsItems {
-    TLS_PROCESS_ID = 0, // unused, and 0 when a thread is created, as on a Vita
+    TLS_RESERVED_0 = 0,
     TLS_THREAD_ID = 1,
     TLS_SP_TOP = 2, // the high end of the stack
     TLS_SP_BOTTOM = 3, // its low end
-    TLS_VFP_EXCEPTION = 4,
-    TLS_RESERVED_5 = 5,
-    TLS_RESERVED_6 = 6, // libc reserved longjump addr
-    TLS_STACK_CHECK_GUARD = 7, // libc reserved some memory address mask
+    TLS_VFP_EXCEPTION = 4, // 0 in callbacks and thread event handlers
+    TLS_LWMUTEX_NO_WAIT = 5, // nonzero makes sceKernelLockLwMutex and sceKernelLockLwMutexCB return CAN_NOT_WAIT
+    TLS_JMPBUF_KEY = 6, // random word per thread that setjmp XORs into the saved SP and LR
+    TLS_STACK_CHECK_GUARD = 7, // random word per process, the stack canary and the libc heap check key
     TLS_CURRENT_PRIORITY = 8,
-    TLS_CPU_AFFINITY_MASK = 9,
-    TLS_NET_ERRNO = 0x40,
-    TLS_FIBER_CONTEXT = 0x41,
+    TLS_CPU_AFFINITY_MASK = 9, // shifted left by 16, as in currentCpuAffinityMask
+    TLS_CLIB_ERROR = 0x20, // error code of the sceClib string to number functions
+    TLS_NET_ERRNO = 0x40, // a positive BSD errno that libnet calls store on failure
+    TLS_FIBER_CONTEXT = 0x41, // the running sceFiberRun record, 0 outside a fiber run
+    TLS_PSP2COMPAT_DATA = 0x42,
+    TLS_ULT_DATA = 0x43,
+    TLS_GPU_SIGNAL_COUNT = 0x44, // last GPU signal count sceGpuSignalWait gave this thread
+    TLS_FIOS2_DATA = 0x4D,
+    TLS_LIBC_ASCTIME = 0x80, // keys 0x80 to 0x87
     TLS_LIBC_ERRNO = 0x88,
+    TLS_NEWLIB_REENT = 0x89, // homebrew newlib struct _reent pointer
+    // The array __tls_get_addr indexes by module index, one pointer to this thread's TLS block of
+    // each module, entry 0 being TPIDRURO itself
+    TLS_LIBC_TLS_ARRAY = 0x8C,
+    // The number of entries in that array, which grows when more modules have TLS
+    TLS_LIBC_TLS_COUNT = 0x8D,
+    // The libc module generation the array was built for. Registering or unregistering a module's
+    // TLS bumps libc's global generation, and __tls_get_addr rebuilds the array when the two differ
+    TLS_LIBC_TLS_GENERATION = 0x8E,
+    TLS_LIBC_MBRLEN_STATE = 0x98,
+    TLS_LIBC_MBRTOWC_STATE = 0xA0,
+    TLS_LIBC_MBSRTOWCS_STATE = 0xA8,
+    TLS_LIBC_MBTOWC_STATE = 0xB0,
+    TLS_LIBC_WCRTOMB_STATE = 0xB8,
+    TLS_LIBC_WCTOMB_S_STATE = 0xBC,
+    TLS_LIBC_WCSRTOMBS_STATE = 0xC0,
+    TLS_LIBC_WCTOMB_STATE = 0xC3,
+    TLS_LIBC_STRERROR = 0xC5, // buffer for unknown codes, keys 0xC5 to 0xC9
+    TLS_LIBC_TM = 0xCA, // struct tm of localtime and gmtime, keys 0xCA to 0xD2
+    TLS_LIBC_STRTOK = 0xD3,
+    TLS_LIBC_CXA_GLOBALS = 0xD4, // C++ exception globals, keys 0xD4 to 0xDC
+    TLS_LIBC_CXA_BUFFER = 0xDD, // C++ runtime buffer of 0x88 bytes, keys 0xDD to 0xFE
 };
 
 struct SceSysmoduleOpt {
@@ -787,7 +825,8 @@ struct SceKernelLMOption {
 
 struct SceKernelLwMutexWork {
     std::uint32_t owner;
-    std::uint32_t unknown0;
+    // Not 0 tells an unlock to go to the kernel
+    std::uint32_t waitCount;
     std::uint32_t lockCount;
     std::uint32_t attr;
     SceUID uid;
@@ -1068,9 +1107,10 @@ struct SceKernelThreadRunStatus {
 struct SceKernelThreadCpuRegisterInfo {
     SceSize size;
     SceUInt32 cpsr;
-    SceUInt32 reg[16];
+    SceUInt32 reg[arm::CORE_REG_COUNT];
     SceUInt32 tpidrurw;
     SceUInt32 teehbr;
+    // TLS slots 2 and 3, the stack's top and bottom
     SceUInt32 sb;
     SceUInt32 st;
 };
@@ -1078,7 +1118,7 @@ struct SceKernelThreadCpuRegisterInfo {
 struct SceKernelThreadVfpRegisterInfo {
     SceSize size;
     SceUInt32 fpscr;
-    SceFloat reg[64];
+    SceFloat reg[arm::EXT_REG_WORDS];
 };
 
 struct SceProcessParam {
@@ -1100,9 +1140,22 @@ struct SceProcessParam {
 struct SceKernelThreadOptParam {
     /** Size of the ::SceKernelThreadOptParam structure. */
     SceSize size;
-    /** Attributes */
+    /** Attributes, the SCE_KERNEL_THREAD_OPT_* bits of the fields they ask for */
     SceUInt32 attr;
+    SceUInt32 kStackMemType;
+    SceUInt32 uStackMemType;
+    SceUInt32 uTLSMemType;
+    SceUInt32 uStackMemid;
+    SceUInt32 data_0x18;
 };
+
+#define SCE_KERNEL_THREAD_OPT_KSTACK_MEMTYPE 0x1U
+#define SCE_KERNEL_THREAD_OPT_USTACK_MEMTYPE 0x2U
+#define SCE_KERNEL_THREAD_OPT_UTLS_MEMTYPE 0x4U
+#define SCE_KERNEL_THREAD_OPT_USTACK_MEMID 0x8U
+#define SCE_KERNEL_THREAD_OPT_DATA_0X18 0x10U
+// The last field's default, also every bit a game may set in it
+#define SCE_KERNEL_THREAD_OPT_DATA_0X18_DEFAULT 0x301U
 
 struct SceKernelCreateThread_opt {
     SceSize size;
