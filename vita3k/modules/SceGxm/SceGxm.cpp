@@ -16,11 +16,18 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include "SceGxm.h"
+#include "../SceProcessmgr/SceProcessmgr.h"
 
 #include <modules/module_parent.h>
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <compare>
+#include <optional>
 #include <span>
 #include <stack>
+#include <string_view>
 #if defined(__x86_64__) && !defined(__APPLE__)
 #include <xxh_x86dispatch.h>
 #else
@@ -1360,6 +1367,30 @@ void shutdown(EmuEnvState &emuenv) {
     const std::lock_guard<std::mutex> callback_guard(emuenv.gxm.callback_lock);
 }
 
+// Compatibility mask libgxm computes at module start, older apps get more permissive checks
+void init_compat_mask(EmuEnvState &emuenv, SceUID thread_id) {
+    static constexpr std::array<std::string_view, 8> titles = { "PCSC00006", "PCSC90003", "PCSA00015", "PCSA00020", "PCSA00025", "PCSF00007", "PCSD00005", "PCSG00178" };
+    const uint32_t version = CALL_EXPORT(sceKernelGetMainModuleSdkVersion);
+    SceUInt32 mask = 0;
+    if (version < 0x01600000)
+        mask = 0xFFFFE;
+    else if (version < 0x01650000)
+        mask = 0xFFFF8;
+    else if (version < 0x01800000)
+        mask = 0xFFFC0;
+    else if (version < 0x02000000)
+        mask = 0xFFE00;
+    else if (version < 0x02100000)
+        mask = 0xFF000;
+    else if (version < 0x02500000)
+        mask = 0xFE000;
+    else if (version < 0x03100000)
+        mask = 0xF8000;
+    if (std::ranges::contains(titles, emuenv.io.title_id))
+        mask |= 1;
+    emuenv.gxm.compat_mask = mask;
+}
+
 } // namespace gxm
 
 struct SceGxmRenderTarget {
@@ -1423,9 +1454,20 @@ struct VertexProgramCacheKey {
 
 typedef std::map<VertexProgramCacheKey, Ptr<SceGxmVertexProgram>> VertexProgramCache;
 
+// The blend and the multisample mode, which only matters with a blend
+struct FragmentBlendKey {
+    uint32_t blend_info; // the bits of the SceGxmBlendInfo
+    SceGxmMultisampleMode multisample_mode;
+    auto operator<=>(const FragmentBlendKey &) const = default;
+};
+
 struct FragmentProgramCacheKey {
-    SceGxmRegisteredProgram fragment_program;
-    SceGxmBlendInfo blend_info;
+    Ptr<const SceGxmProgram> program;
+    std::array<uint8_t, 10> vertex_output_mapping;
+    SceGxmOutputRegisterFormat output_format;
+    // Empty when the program doesn't blend
+    std::optional<FragmentBlendKey> blend;
+    std::strong_ordering operator<=>(const FragmentProgramCacheKey &) const = default;
 };
 
 typedef std::map<FragmentProgramCacheKey, Ptr<SceGxmFragmentProgram>> FragmentProgramCache;
@@ -1476,20 +1518,6 @@ static bool operator<(const VertexProgramCacheKey &a, const VertexProgramCacheKe
         return false;
     }
     return b.hash < a.hash;
-}
-
-static bool operator<(const SceGxmBlendInfo &a, const SceGxmBlendInfo &b) {
-    return memcmp(&a, &b, sizeof(a)) < 0;
-}
-
-static bool operator<(const FragmentProgramCacheKey &a, const FragmentProgramCacheKey &b) {
-    if (a.fragment_program < b.fragment_program) {
-        return true;
-    }
-    if (b.fragment_program < a.fragment_program) {
-        return false;
-    }
-    return b.blend_info < a.blend_info;
 }
 
 static int init_texture_base(const char *export_name, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat tex_format, uint32_t width, uint32_t height, uint32_t mipCount,
@@ -1839,10 +1867,69 @@ EXPORT(SceGxmColorSurfaceType, sceGxmColorSurfaceGetType, const SceGxmColorSurfa
     return surface->surfaceType;
 }
 
+// Allows the U8S8S8U8 color surface format, set for apps built before 3.10
+static constexpr SceUInt32 COMPAT_OLD_COLOR_FORMATS = 0x10000;
+// Skips the color surface scale mode and type checks, set for apps built before 2.50
+static constexpr SceUInt32 COMPAT_NO_SURFACE_MODE_CHECKS = 0x2000;
+
+struct ColorFormatSupport {
+    bool size_32;
+    bool size_64;
+    bool downscale;
+};
+
+// Output register sizes and MSAA downscale of a color surface format, none for a format libgxm refuses
+static std::optional<ColorFormatSupport> get_color_format_support(SceGxmColorBaseFormat format) {
+    switch (format) {
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8:
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8:
+    case SCE_GXM_COLOR_BASE_FORMAT_U5U6U5:
+    case SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5:
+    case SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4:
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2:
+    case SCE_GXM_COLOR_BASE_FORMAT_S5S5U6:
+        return ColorFormatSupport{ true, true, true };
+    case SCE_GXM_COLOR_BASE_FORMAT_F16:
+    case SCE_GXM_COLOR_BASE_FORMAT_F16F16:
+    case SCE_GXM_COLOR_BASE_FORMAT_S16:
+    case SCE_GXM_COLOR_BASE_FORMAT_S16S16:
+    case SCE_GXM_COLOR_BASE_FORMAT_U16:
+    case SCE_GXM_COLOR_BASE_FORMAT_U16U16:
+    case SCE_GXM_COLOR_BASE_FORMAT_U8:
+    case SCE_GXM_COLOR_BASE_FORMAT_S8:
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U8:
+    case SCE_GXM_COLOR_BASE_FORMAT_S8S8:
+    case SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8:
+        return ColorFormatSupport{ true, false, true };
+    case SCE_GXM_COLOR_BASE_FORMAT_F32:
+        return ColorFormatSupport{ true, false, false };
+    case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10:
+    case SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16:
+    case SCE_GXM_COLOR_BASE_FORMAT_F11F11F10:
+    case SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9:
+    case SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10:
+        return ColorFormatSupport{ false, true, true };
+    case SCE_GXM_COLOR_BASE_FORMAT_F32F32:
+        return ColorFormatSupport{ false, true, false };
+    case SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8:
+        return ColorFormatSupport{ true, true, true };
+    default:
+        return std::nullopt;
+    }
+}
+
 EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorFormat colorFormat, SceGxmColorSurfaceType surfaceType, SceGxmColorSurfaceScaleMode scaleMode, SceGxmOutputRegisterSize outputRegisterSize, uint32_t width, uint32_t height, uint32_t strideInPixels, Ptr<void> data) {
     TRACY_FUNC(sceGxmColorSurfaceInit, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
     if (!surface)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+
+    const SceGxmColorBaseFormat base_format = gxm::get_base_format(colorFormat);
+    if (base_format == SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8 && !(emuenv.gxm.compat_mask & COMPAT_OLD_COLOR_FORMATS))
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    const std::optional<ColorFormatSupport> support = get_color_format_support(base_format);
+    if (!support)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
     if (width == 0 || width > 4096 || height == 0 || height > 4096)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
@@ -1853,9 +1940,33 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
     if ((strideInPixels < width) || ((data.address() & 3) != 0))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
-    // if the surface is swizzled, width and height must be power of 2
-    if (surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED && ((width & (width - 1)) || (height & (height - 1))))
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_ALIGNMENT);
+    if (!(emuenv.gxm.compat_mask & COMPAT_NO_SURFACE_MODE_CHECKS)) {
+        if (scaleMode > SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+        if (surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR && surfaceType != SCE_GXM_COLOR_SURFACE_TILED && surfaceType != SCE_GXM_COLOR_SURFACE_SWIZZLED)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
+    if (scaleMode != SCE_GXM_COLOR_SURFACE_SCALE_NONE && !support->downscale)
+        return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
+
+    if (surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED && (width < 16 || height < 16 || !std::has_single_bit(width) || !std::has_single_bit(height)))
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    if (surfaceType == SCE_GXM_COLOR_SURFACE_TILED && (width < 32 || height < 32))
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    if (!(outputRegisterSize == SCE_GXM_OUTPUT_REGISTER_SIZE_64BIT ? support->size_64 : support->size_32))
+        return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
+
+    const uint32_t stride_in_bytes = static_cast<uint32_t>(gxm::bits_per_pixel(base_format) * strideInPixels / 8);
+    const bool plain_linear = align(width, 8) == strideInPixels;
+    if (surfaceType != SCE_GXM_COLOR_SURFACE_TILED && surfaceType != SCE_GXM_COLOR_SURFACE_SWIZZLED && !plain_linear) {
+        // A 24 bit format takes only the plain linear stride
+        if (gxm::bits_per_pixel(base_format) == 24 || stride_in_bytes < 4 || stride_in_bytes > 131072)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
 
     memset(surface, 0, sizeof(SceGxmColorSurface));
     surface->disabled = 0;
@@ -1881,10 +1992,9 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
         return CALL_EXPORT(sceGxmTextureInitTiled, &surface->backgroundTex, surface->data, tex_format, width, height, 1);
     default:
         // linear
-        if (align(width, 8) == strideInPixels) {
+        if (plain_linear) {
             return CALL_EXPORT(sceGxmTextureInitLinear, &surface->backgroundTex, surface->data, tex_format, width, height, 1);
         } else {
-            uint32_t stride_in_bytes = static_cast<uint32_t>(gxm::bits_per_pixel(gxm::get_base_format(colorFormat)) * strideInPixels / 8);
             return CALL_EXPORT(sceGxmTextureInitLinearStrided, &surface->backgroundTex, surface->data, tex_format, width, height, stride_in_bytes);
         }
     }
@@ -4580,6 +4690,29 @@ EXPORT(int, sceGxmShaderPatcherCreate, const SceGxmShaderPatcherParams *params, 
     return 0;
 }
 
+// Whether the blend changes the color the surface gets. A full color mask with each function NONE,
+// or ADD or SUBTRACT of ONE and ZERO, writes the fragment color unchanged.
+static bool is_blending(const SceGxmBlendInfo &blend) {
+    const auto passes = [](SceGxmBlendFunc func, SceGxmBlendFactor src, SceGxmBlendFactor dst) {
+        return func == SCE_GXM_BLEND_FUNC_NONE
+            || ((func == SCE_GXM_BLEND_FUNC_ADD || func == SCE_GXM_BLEND_FUNC_SUBTRACT) && src == SCE_GXM_BLEND_FACTOR_ONE && dst == SCE_GXM_BLEND_FACTOR_ZERO);
+    };
+    return blend.colorMask != SCE_GXM_COLOR_MASK_ALL || !passes(blend.colorFunc, blend.colorSrc, blend.colorDst) || !passes(blend.alphaFunc, blend.alphaSrc, blend.alphaDst);
+}
+
+// Where each of the first nine texture coordinates of the vertex program goes, 0 to 9 in order without a vertex program
+static std::array<uint8_t, 10> vertex_output_mapping(const SceGxmProgram *vertex_program) {
+    std::array<uint8_t, 10> mapping = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    if (!vertex_program)
+        return mapping;
+
+    const uint32_t texcoords = vertex_program->vertex_varyings()->vertex_outputs2;
+    uint8_t next = 0;
+    for (size_t i = 0; i < 9; i++)
+        mapping[i] = ((texcoords >> (i * 3)) & 7) ? next++ : 9;
+    return mapping;
+}
+
 EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, SceGxmOutputRegisterFormat outputFormat, SceGxmMultisampleMode multisampleMode, const SceGxmBlendInfo *blendInfo, Ptr<const SceGxmProgram> vertexProgram, Ptr<SceGxmFragmentProgram> *fragmentProgram) {
     TRACY_FUNC(sceGxmShaderPatcherCreateFragmentProgram, shaderPatcher, programId, outputFormat, multisampleMode, blendInfo, vertexProgram, fragmentProgram);
     MemState &mem = emuenv.mem;
@@ -4587,19 +4720,12 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     if (!shaderPatcher || !programId || !fragmentProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    static const SceGxmBlendInfo default_blend_info = {
-        SCE_GXM_COLOR_MASK_ALL,
-        SCE_GXM_BLEND_FUNC_NONE,
-        SCE_GXM_BLEND_FUNC_NONE,
-        SCE_GXM_BLEND_FACTOR_ONE,
-        SCE_GXM_BLEND_FACTOR_ZERO,
-        SCE_GXM_BLEND_FACTOR_ONE,
-        SCE_GXM_BLEND_FACTOR_ZERO
-    };
-    const FragmentProgramCacheKey key = {
-        *programId,
-        (blendInfo != nullptr) ? *blendInfo : default_blend_info
-    };
+    if (blendInfo && !is_blending(*blendInfo))
+        blendInfo = nullptr;
+
+    FragmentProgramCacheKey key = { programId->program, vertex_output_mapping(vertexProgram.get(mem)), outputFormat };
+    if (blendInfo)
+        key.blend = FragmentBlendKey{ std::bit_cast<uint32_t>(*blendInfo), multisampleMode };
     FragmentProgramCache::const_iterator cached = shaderPatcher->fragment_program_cache.find(key);
     if (cached != shaderPatcher->fragment_program_cache.end()) {
         ++cached->second.get(mem)->reference_count;
@@ -4741,7 +4867,7 @@ EXPORT(int, sceGxmShaderPatcherForceUnregisterProgram, SceGxmShaderPatcher *shad
         }
     } else {
         for (auto it = shaderPatcher->fragment_program_cache.begin(); it != shaderPatcher->fragment_program_cache.end();) {
-            if (it->first.fragment_program.program == rp->program) {
+            if (it->first.program == rp->program) {
                 SceGxmFragmentProgram *frag_program = it->second.get(emuenv.mem);
                 while (frag_program->compile_threads_on.load(std::memory_order_acquire) > 0)
                     std::this_thread::yield();
@@ -5147,6 +5273,16 @@ EXPORT(int, sceGxmTextureInitLinear, SceGxmTexture *texture, Ptr<const void> dat
     return result;
 }
 
+// Stores stride / 4 - 1 in the 15 stride bits of a strided texture's word 0
+static void set_texture_stride(SceGxmTexture &texture, uint32_t byteStride) {
+    const uint32_t stride_compressed = (byteStride >> 2) - 1;
+    texture.mip_filter = stride_compressed & 1;
+    texture.min_filter = (stride_compressed >> 1) & 3;
+    texture.mip_count = (stride_compressed >> 3) & 15;
+    texture.lod_bias = (stride_compressed >> 7) & 63;
+    texture.stride_hi = stride_compressed >> 13;
+}
+
 EXPORT(int, sceGxmTextureInitLinearStrided, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat texFormat, uint32_t width, uint32_t height, uint32_t byteStride) {
     TRACY_FUNC(sceGxmTextureInitLinearStrided, texture, data, texFormat, width, height, byteStride);
     if (!texture) {
@@ -5167,11 +5303,7 @@ EXPORT(int, sceGxmTextureInitLinearStrided, SceGxmTexture *texture, Ptr<const vo
 
     memset(texture, 0, sizeof(SceGxmTexture));
 
-    const uint32_t stride_compressed = (byteStride >> 2) - 1;
-    texture->mip_filter = stride_compressed & 1;
-    texture->min_filter = (stride_compressed & 0b0000110) >> 1;
-    texture->mip_count = (stride_compressed & 0b1111000) >> 3;
-    texture->lod_bias = (stride_compressed & 0b1111110000000) >> 7;
+    set_texture_stride(*texture, byteStride);
     texture->base_format = (texFormat & 0x1F000000) >> 24;
     texture->type = SCE_GXM_TEXTURE_LINEAR_STRIDED >> 29;
     texture->data_addr = data.address() >> 2;
@@ -5417,7 +5549,8 @@ EXPORT(int, sceGxmTextureSetStride, SceGxmTexture *texture, uint32_t byteStride)
     if ((byteStride < 4) || (byteStride > 131072))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
-    return UNIMPLEMENTED();
+    set_texture_stride(*texture, byteStride);
+    return 0;
 }
 
 static bool verify_texture_mode(SceGxmTexture *texture, SceGxmTextureAddrMode mode) {
