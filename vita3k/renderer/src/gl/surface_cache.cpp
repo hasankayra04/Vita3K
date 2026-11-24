@@ -32,6 +32,7 @@ void GLSurfaceCache::cleanup() {
     color_surface_textures.clear();
     scene_color_address = 0;
     srgb_copies.clear();
+    gamma_samplings.clear();
 
     for (auto &ds : depth_stencil_textures) {
         ds.gl_texture.cleanup();
@@ -51,9 +52,28 @@ void GLSurfaceCache::cleanup() {
 }
 
 void GLSurfaceCache::do_typeless_copy(const GLuint dest_texture, const GLuint source_texture, const GLenum dest_internal,
-    const GLenum dest_upload_format, const GLenum dest_type, const GLenum source_format, const GLenum source_type, const int offset_x,
-    const int offset_y, const int width, const int height, const int dest_width, const int dest_height, const std::size_t total_source_size) {
-    static constexpr GLsizei I32_SIGNED_MAX = 0x7FFFFFFF;
+    const GLenum dest_upload_format, const GLenum dest_type, const int dest_bpp, const GLenum source_format, const GLenum source_type,
+    const int source_bpp, const int dest_x, const int y, const int source_texture_width, const int dest_width, const int height) {
+    glBindTexture(GL_TEXTURE_2D, dest_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, dest_internal, dest_width, height, 0, dest_upload_format, dest_type, nullptr);
+
+    // Both formats share the same bytes per row, so the copy works on byte ranges. With larger source pixels the
+    // first one read can start before dest_x: skip the dest pixels in front of it.
+    const int start_byte = dest_x * dest_bpp;
+    const int source_x = start_byte / source_bpp;
+    const int skip_pixels = (start_byte - source_x * source_bpp) / dest_bpp;
+    int source_width = std::min((start_byte + dest_width * dest_bpp + source_bpp - 1) / source_bpp - source_x, source_texture_width - source_x);
+    // read whole dest pixels, so that the packed rows are as long as the unpacked ones
+    if (dest_bpp > source_bpp)
+        source_width -= source_width % (dest_bpp / source_bpp);
+    if (source_width <= 0)
+        return;
+
+    const int row_length = source_width * source_bpp / dest_bpp;
+    const int copy_width = std::min(dest_width, row_length - skip_pixels);
+    if (copy_width <= 0)
+        return;
+    const std::size_t copy_size = static_cast<std::size_t>(source_width) * source_bpp * height;
 
     if (!typeless_copy_buffer[0]) {
         if (!typeless_copy_buffer.init(glGenBuffers, glDeleteBuffers)) {
@@ -62,26 +82,38 @@ void GLSurfaceCache::do_typeless_copy(const GLuint dest_texture, const GLuint so
         }
     }
 
-    if (total_source_size > typeless_copy_buffer_size) {
+    if (copy_size > typeless_copy_buffer_size) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, typeless_copy_buffer[0]);
-        glBufferData(GL_PIXEL_PACK_BUFFER, total_source_size, nullptr, GL_STATIC_COPY);
+        glBufferData(GL_PIXEL_PACK_BUFFER, copy_size, nullptr, GL_STATIC_COPY);
 
-        typeless_copy_buffer_size = total_source_size;
+        typeless_copy_buffer_size = copy_size;
     }
 
+    GLint pack_alignment, unpack_alignment;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_alignment);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
     glBindBuffer(GL_PIXEL_PACK_BUFFER, typeless_copy_buffer[0]);
-    glGetTextureSubImage(source_texture, 0, offset_x, offset_y, 0, width, height, 1, source_format, source_type, I32_SIGNED_MAX, nullptr);
+    glGetTextureSubImage(source_texture, 0, source_x, y, 0, source_width, height, 1, source_format, source_type, static_cast<GLsizei>(copy_size), nullptr);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, GL_NONE);
 
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, typeless_copy_buffer[0]);
-    glBindTexture(GL_TEXTURE_2D, dest_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, dest_internal, dest_width, dest_height, 0, dest_upload_format, dest_type, nullptr);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, copy_width, height, dest_upload_format, dest_type, nullptr);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, GL_NONE);
+
+    glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_alignment);
 }
 
 GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state, std::uint16_t width, std::uint16_t height, const std::uint32_t pixel_stride,
     const SceGxmColorBaseFormat base_format, Ptr<void> address, SurfaceTextureRetrievePurpose purpose, std::uint32_t &swizzle,
-    std::uint16_t *stored_height, std::uint16_t *stored_width) {
+    std::uint16_t *stored_height, std::uint16_t *stored_width, bool srgb) {
     // Create the key to access the cache struct
     const std::uint64_t key = address.address();
 
@@ -110,6 +142,11 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
     GLenum surface_upload_format = color::translate_format(base_format);
     GLenum surface_data_type = color::translate_type(base_format);
 
+    // gamma corrected writes are encoded by the hardware into an sRGB surface
+    const bool write_srgb = purpose == SurfaceTextureRetrievePurpose::WRITING && srgb && support_srgb_decode && surface_internal_format == GL_RGBA8;
+    if (write_srgb)
+        surface_internal_format = GL_SRGB8_ALPHA8;
+
     std::size_t bytes_per_stride = pixel_stride * color::bytes_per_pixel(base_format);
     std::size_t total_surface_size = bytes_per_stride * original_height;
 
@@ -137,14 +174,14 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
         // 2. Same base address, but width and height change to be larger, or format change if write. Remake a new one for both read and write situation.
         // 3. Out of cache range. In write case, create a new one, in read case, lul
         // 4. Read situation with smaller width and height, probably need to extract the needed region out.
-        const bool addr_in_range_of_cache = ((key + total_surface_size) <= (ite->first + info.total_bytes));
+        bool addr_in_range_of_cache = ((key + total_surface_size) <= (ite->first + info.total_bytes));
         const bool cache_probably_freed = ((ite->first != key) && addr_in_range_of_cache && (purpose == SurfaceTextureRetrievePurpose::WRITING));
         const bool surface_extent_changed = (info.width < width) || (info.height < height);
         bool surface_stat_changed = false;
 
         if (ite->first == key) {
             if (purpose == SurfaceTextureRetrievePurpose::WRITING) {
-                surface_stat_changed = surface_extent_changed || (base_format != info.format);
+                surface_stat_changed = surface_extent_changed || (base_format != info.format) || (write_srgb != info.srgb);
             } else {
                 // If the extent changed but format is not the same, then the probability of it being a cast is high
                 surface_stat_changed = surface_extent_changed && (base_format == info.format);
@@ -167,6 +204,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
             // Remake locally to avoid making changes to framebuffer array
             uint16_t prev_width = info.width;
             uint16_t prev_height = info.height;
+            // only the sRGB encoding changed, the stored bytes stay valid
+            const bool keep_content = !surface_extent_changed && (base_format == info.format) && (purpose == SurfaceTextureRetrievePurpose::WRITING);
             info.width = width;
             info.height = height;
             info.original_width = original_width;
@@ -175,11 +214,19 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
             info.format = base_format;
             info.total_bytes = total_surface_size;
             info.flags = 0;
+            if (purpose == SurfaceTextureRetrievePurpose::WRITING)
+                info.srgb = write_srgb;
+            else if (info.srgb)
+                // a read keeps the encoding the surface was written with
+                surface_internal_format = GL_SRGB8_ALPHA8;
 
             bool store_rawly = false;
 
             auto remake_and_apply_filters = [&](GLuint bind_texture_id) {
-                if (prev_width <= info.width && prev_height <= info.height && surface_extent_changed) {
+                if ((surface_extent_changed && prev_width <= info.width && prev_height <= info.height) || keep_content) {
+                    // a surface whose encoding changed can also be smaller, keep what overlaps
+                    const GLsizei copy_width = std::min<GLsizei>(prev_width, info.width);
+                    const GLsizei copy_height = std::min<GLsizei>(prev_height, info.height);
                     GLuint temp_texture;
                     glGenTextures(1, &temp_texture);
                     glBindTexture(GL_TEXTURE_2D, temp_texture);
@@ -204,7 +251,7 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                     }
-                    glCopyImageSubData(temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, bind_texture_id, GL_TEXTURE_2D, 0, 0, 0, 0, prev_width, prev_height, 1);
+                    glCopyImageSubData(temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, bind_texture_id, GL_TEXTURE_2D, 0, 0, 0, 0, copy_width, copy_height, 1);
 
                     glDeleteTextures(1, &temp_texture);
                 } else {
@@ -242,11 +289,15 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
 
             release_srgb_copies(info);
             info.casted_textures.clear();
+
+            if (purpose == SurfaceTextureRetrievePurpose::WRITING)
+                addr_in_range_of_cache = true;
         }
-        if ((purpose == SurfaceTextureRetrievePurpose::WRITING) && (swizzle != info.swizzle)) {
-            info.swizzle = swizzle;
-        } else if (purpose == SurfaceTextureRetrievePurpose::READING) {
-            swizzle = info.swizzle;
+        if (!cache_probably_freed) {
+            if (purpose == SurfaceTextureRetrievePurpose::WRITING)
+                info.swizzle = swizzle;
+            else if (purpose == SurfaceTextureRetrievePurpose::READING)
+                swizzle = info.swizzle;
         }
         if (!addr_in_range_of_cache) {
             if (purpose == SurfaceTextureRetrievePurpose::WRITING) {
@@ -341,8 +392,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
                                         0, 0, 0, 0, width, height, 1);
                                 } else {
                                     do_typeless_copy(casted_vec[i]->texture[0], source_texture, surface_internal_format, surface_upload_format,
-                                        surface_data_type, source_format, source_data_type, static_cast<GLint>(start_x), static_cast<GLint>(start_sourced_line), info.width,
-                                        height, width, height, info.total_bytes);
+                                        surface_data_type, static_cast<int>(bytes_per_pixel_requested), source_format, source_data_type, static_cast<int>(bytes_per_pixel_in_store),
+                                        static_cast<int>(start_x), static_cast<int>(start_sourced_line), info.width, width, height);
                                 }
 
                                 casted_vec[i]->last_used_time = current_time;
@@ -380,11 +431,10 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
                         glCopyImageSubData(source_texture, GL_TEXTURE_2D, 0, static_cast<GLint>(start_x), static_cast<GLint>(start_sourced_line), 0, casted_info.texture[0], GL_TEXTURE_2D,
                             0, 0, 0, 0, width, height, 1);
                     } else {
-                        // TODO: Copy sub region of typeless copy is still not handled ((
                         // We must do a typeless copy (RPCS3)
                         do_typeless_copy(casted_info.texture[0], source_texture, surface_internal_format, surface_upload_format,
-                            surface_data_type, source_format, source_data_type, static_cast<GLint>(start_x), static_cast<GLint>(start_sourced_line), info.width,
-                            height, width, height, info.total_bytes);
+                            surface_data_type, static_cast<int>(bytes_per_pixel_requested), source_format, source_data_type, static_cast<int>(bytes_per_pixel_in_store),
+                            static_cast<int>(start_x), static_cast<int>(start_sourced_line), info.width, width, height);
 
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -452,6 +502,7 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
     info_added->data = address;
     info_added->total_bytes = bytes_per_stride * original_height;
     info_added->format = base_format;
+    info_added->srgb = write_srgb;
     info_added->swizzle = swizzle;
     info_added->flags = 0;
     info_added->is_ping_pong_dirty = true;
@@ -484,6 +535,17 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
+
+    // Start from zero as Vulkan does: the content of a new texture is undefined, AMD drivers hand out
+    // memory that held other data, which reads as NaN in float formats. Uncharted keeps its exposure in
+    // a F11F11F10 surface that it updates from its previous value, so one NaN made the screen black for good.
+#ifdef __ANDROID__
+    // GLES has no glClearTexImage, upload zeros (16 bytes covers the largest pixel)
+    const std::vector<std::uint8_t> zeros(static_cast<std::size_t>(width) * height * 16);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, surface_upload_format, surface_data_type, zeros.data());
+#else
+    glClearTexImage(texture_handle_return, 0, surface_upload_format, surface_data_type, nullptr);
+#endif
 
     if (const auto previous = color_surface_textures.find(key); previous != color_surface_textures.end()) {
         // the new surface replaces the one at the same address that it does not fit in
@@ -576,12 +638,15 @@ void GLSurfaceCache::release_srgb_copies(const GLColorSurfaceCacheInfo &info) {
         srgb_copies.erase(casted->texture[0]);
 }
 
-GLuint GLSurfaceCache::retrieve_srgb_copy(GLuint texture) {
+GLuint GLSurfaceCache::retrieve_srgb_copy(GLuint texture, bool *created) {
     GLint width = 0, height = 0, internal_format = 0;
     glBindTexture(GL_TEXTURE_2D, texture);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal_format);
+    // a surface written with gamma is already stored as sRGB
+    if (internal_format == GL_SRGB8_ALPHA8)
+        return texture;
     if (internal_format != GL_RGBA8) {
         LOG_WARN_ONCE("Trying to use gamma correction with non-compatible surface format {}", log_hex(internal_format));
         return texture;
@@ -599,11 +664,111 @@ GLuint GLSurfaceCache::retrieve_srgb_copy(GLuint texture) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         copy->width = width;
         copy->height = height;
+        if (created)
+            *created = true;
     }
 
     glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
     glCopyImageSubData(texture, GL_TEXTURE_2D, 0, 0, 0, 0, copy->texture[0], GL_TEXTURE_2D, 0, 0, 0, 0, width, height, 1);
     return copy->texture[0];
+}
+
+static void respecify_keeping_content(const GLuint texture, const GLenum internal_format, const GLsizei width, const GLsizei height) {
+    GLint last_texture = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_texture);
+
+    GLuint temp_texture;
+    glGenTextures(1, &temp_texture);
+    glBindTexture(GL_TEXTURE_2D, temp_texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, internal_format, width, height);
+    glCopyImageSubData(texture, GL_TEXTURE_2D, 0, 0, 0, 0, temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, width, height, 1);
+
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glCopyImageSubData(temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, texture, GL_TEXTURE_2D, 0, 0, 0, 0, width, height, 1);
+
+    glDeleteTextures(1, &temp_texture);
+    glBindTexture(GL_TEXTURE_2D, last_texture);
+}
+
+void GLSurfaceCache::set_color_surface_srgb(Ptr<void> address, bool srgb) {
+    const auto ite = color_surface_textures.find(address.address());
+    if (ite == color_surface_textures.end())
+        return;
+
+    GLColorSurfaceCacheInfo &info = *ite->second;
+    // same check as for gamma writes: every format stored as RGBA8 can be sRGB
+    if (info.srgb == srgb || color::translate_internal_format(info.format) != GL_RGBA8)
+        return;
+
+    info.srgb = srgb;
+    // earlier draws may have written the surface through image stores, the copy must see them
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+    const GLenum internal_format = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+    respecify_keeping_content(info.gl_texture[0], internal_format, info.width, info.height);
+    if (info.gl_ping_pong_texture[0])
+        respecify_keeping_content(info.gl_ping_pong_texture[0], internal_format, info.width, info.height);
+}
+
+void GLSurfaceCache::set_gamma_sampling(std::size_t unit, GLuint surface) {
+    if (surface)
+        gamma_samplings[unit] = { surface, false };
+    else
+        gamma_samplings.erase(unit);
+}
+
+// the sampling state that sync_texture set on the surface, for its sRGB copy
+static void copy_sampling_parameters(const GLuint from, const GLuint to) {
+    static constexpr GLenum params[] = { GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+        GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A };
+    GLint values[std::size(params)];
+    glBindTexture(GL_TEXTURE_2D, from);
+    for (std::size_t i = 0; i < std::size(params); i++)
+        glGetTexParameteriv(GL_TEXTURE_2D, params[i], &values[i]);
+    glBindTexture(GL_TEXTURE_2D, to);
+    for (std::size_t i = 0; i < std::size(params); i++)
+        glTexParameteri(GL_TEXTURE_2D, params[i], values[i]);
+}
+
+void GLSurfaceCache::refresh_gamma_samplings() {
+    if (gamma_samplings.empty())
+        return;
+
+    bool rebound = false;
+    for (auto it = gamma_samplings.begin(); it != gamma_samplings.end();) {
+        GammaSampling &sampling = it->second;
+        const auto surface = std::ranges::find_if(color_surface_textures, [&](const auto &entry) { return entry.second->gl_texture[0] == sampling.surface; });
+        if (surface == color_surface_textures.end()) {
+            it = gamma_samplings.erase(it);
+            continue;
+        }
+
+        const bool srgb_storage = surface->second->srgb;
+        if (srgb_storage && !sampling.on_copy) {
+            ++it;
+            continue;
+        }
+
+        glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + it->first));
+        if (srgb_storage) {
+            glBindTexture(GL_TEXTURE_2D, sampling.surface);
+        } else {
+            // RGBA8 storage is not decoded, sample an sRGB copy of what the surface holds now
+            bool created = false;
+            const GLuint copy = retrieve_srgb_copy(sampling.surface, &created);
+            // a new copy (first use, or remade after a resize) has the default parameters
+            if (!sampling.on_copy || created)
+                copy_sampling_parameters(sampling.surface, copy);
+            glBindTexture(GL_TEXTURE_2D, copy);
+        }
+        sampling.on_copy = !srgb_storage;
+        rebound = true;
+        ++it;
+    }
+
+    // the rest of the renderer binds its textures on unit 0, as sync_texture leaves it
+    if (rebound)
+        glActiveTexture(GL_TEXTURE0);
 }
 
 GLuint GLSurfaceCache::retrieve_ping_pong_color_surface_texture_handle(Ptr<void> address) {
@@ -617,7 +782,7 @@ GLuint GLSurfaceCache::retrieve_ping_pong_color_surface_texture_handle(Ptr<void>
     if (!info.is_ping_pong_dirty)
         return info.gl_ping_pong_texture[0];
 
-    GLenum surface_internal_format = color::translate_internal_format(info.format);
+    GLenum surface_internal_format = info.srgb ? GL_SRGB8_ALPHA8 : color::translate_internal_format(info.format);
     GLenum surface_upload_format = color::translate_format(info.format);
     GLenum surface_data_type = color::translate_type(info.format);
 
@@ -774,7 +939,7 @@ GLuint GLSurfaceCache::retrieve_framebuffer_handle(const State &state, const Mem
         std::uint32_t swizzle_set = color->colorFormat & SCE_GXM_COLOR_SWIZZLE_MASK;
         color_handle = retrieve_color_surface_texture_handle(state, color->width,
             color->height, color->strideInPixels, gxm::get_base_format(color->colorFormat), color->data,
-            SurfaceTextureRetrievePurpose::WRITING, swizzle_set, stored_height);
+            SurfaceTextureRetrievePurpose::WRITING, swizzle_set, stored_height, nullptr, color->gamma != 0);
     } else {
         color_handle = target->attachments[0];
     }

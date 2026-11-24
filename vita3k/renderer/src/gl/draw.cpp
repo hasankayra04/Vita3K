@@ -107,8 +107,22 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     const SceGxmColorBaseFormat base_format = gxm::get_base_format(context.record.color_surface.colorFormat);
     const GLenum surface_format = color::translate_internal_format(base_format);
 
+    const bool both_side_fragment_program_disabled = (context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED)
+        && ((context.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED) || (context.record.two_sided == SCE_GXM_TWO_SIDED_DISABLED));
+
+    const bool binds_color_image = fragment_program_gxp.is_frag_color_used() && features.is_programmable_blending_need_to_bind_color_attachment()
+        && !both_side_fragment_program_disabled && !use_raw_image;
+    if (context.record.color_surface.gamma && renderer.surface_cache.support_srgb_decode && surface_format == GL_RGBA8)
+        // sRGB textures cannot be used as images (reads return 0), the shader does the conversion then
+        renderer.surface_cache.set_color_surface_srgb(context.record.color_surface.data, !binds_color_image);
+    renderer.surface_cache.refresh_gamma_samplings();
+
     if (fragment_program_gxp.is_frag_color_used() && features.is_programmable_blending_need_to_bind_color_attachment()) {
-        if (use_raw_image) {
+        if (both_side_fragment_program_disabled) {
+            // The color mask does not stop image stores, but stores to an unbound image have no effect
+            glBindImageTexture(shader::COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16UI);
+            glBindImageTexture(shader::COLOR_ATTACHMENT_TEXTURE_SLOT_IMAGE, 0, 0, GL_FALSE, 0, GL_READ_WRITE, surface_format);
+        } else if (use_raw_image) {
             glBindImageTexture(shader::COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE, context.current_color_attachment, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16UI);
             glBindImageTexture(shader::COLOR_ATTACHMENT_TEXTURE_SLOT_IMAGE, 0, 0, GL_FALSE, 0, GL_READ_WRITE, surface_format);
         } else {
@@ -118,7 +132,9 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     }
 
     if (renderer.features.use_mask_bit)
-        glBindImageTexture(shader::MASK_TEXTURE_SLOT_IMAGE, context.render_target->masktexture[0], 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+        // The shader only reads it, but on AMD integrated GPUs a read-only binding does not see the
+        // fast clear done by glClearTexImage in sync_mask: every load returns 0 and all fragments are discarded
+        glBindImageTexture(shader::MASK_TEXTURE_SLOT_IMAGE, context.render_target->masktexture[0], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA8);
 
     shader::RenderVertUniformBlock &vert_ublock = context.current_vert_render_info;
     vert_ublock.viewport_flip = context.record.viewport_flip;
@@ -138,8 +154,6 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     }
 
     shader::RenderFragUniformBlock &frag_ublock = context.current_frag_render_info;
-    const bool both_side_fragment_program_disabled = (context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED)
-        && ((context.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED) || (context.record.two_sided == SCE_GXM_TWO_SIDED_DISABLED));
     if (both_side_fragment_program_disabled) {
         frag_ublock.front_disabled = 0.0f;
         frag_ublock.back_disabled = 0.0f;
@@ -161,6 +175,8 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     }
     frag_ublock.writing_mask = context.record.writing_mask;
     frag_ublock.use_raw_image = static_cast<float>(use_raw_image);
+    // must match the format used by the surface cache
+    frag_ublock.is_srgb = (context.record.color_surface.gamma && renderer.surface_cache.support_srgb_decode && surface_format == GL_RGBA8) ? 1.0f : 0.0f;
     frag_ublock.res_multiplier = renderer.res_multiplier;
     const bool has_msaa = context.render_target->multisample_mode;
     const bool has_downscale = context.record.color_surface.downscale;
