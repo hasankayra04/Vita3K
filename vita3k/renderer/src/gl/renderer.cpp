@@ -410,13 +410,12 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const 
 
     // TODO: Take request to force load from given memory
     // Sync depth/stencil based on depth stencil surface.
-    sync_depth_data(context.record);
+    sync_depth_stencil_data(context.record);
     sync_depth_func(context.record.front_depth_func, true);
     sync_depth_func(context.record.back_depth_func, false);
     sync_depth_write_enable(context.record.front_depth_write_mode, true);
     sync_depth_write_enable(context.record.back_depth_write_mode, false);
 
-    sync_stencil_data(context.record, mem);
     sync_stencil_func(context.record, true);
     sync_stencil_func(context.record, false);
 
@@ -772,6 +771,7 @@ void GLState::complete_readbacks(MemState &mem, bool wait) {
                 LOG_ERROR("Could not read back a surface, the guest surface at {} is left unchanged", fmt::ptr(pixels));
         }
         if (source && pixels) {
+            texture_cache.invalidate_hashes();
             if (readback.use_temp) {
                 readback_scratch.resize(readback.size);
                 std::memcpy(readback_scratch.data(), source, readback.size);

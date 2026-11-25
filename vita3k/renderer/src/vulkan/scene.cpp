@@ -452,6 +452,19 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     if (!context.in_renderpass)
         context.start_render_pass(true, maskupdate);
 
+    // a draw whose color nothing observes and which leaves depth, stencil and guest memory untouched has no effect,
+    // unless it counts samples for a visibility query (the render pass is started above so the scene still clears)
+    if (context.record.skip_color_output && !may_write_depth_stencil(context.record) && !may_store_to_memory(context.record, mem)
+        && !(context.current_visibility_buffer != nullptr && context.current_query_idx != -1)) {
+        for (auto &stream : context.record.vertex_streams) {
+            stream.data = nullptr;
+            stream.size = 0;
+        }
+        context.vertex_uniform_storage_allocated = false;
+        context.fragment_uniform_storage_allocated = false;
+        return;
+    }
+
     // when we do multiple render pass for one scene (shader interlock or slow macroblock),
     // we need to always load the depth-stencil after the first draw
     if (!maskupdate && context.is_first_scene_draw && (context.state.features.support_shader_interlock || context.state.features.use_mask_bit || context.ignore_macroblock)) {
@@ -478,7 +491,8 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         context.render_cmd.beginRenderPass(context.curr_renderpass_info, vk::SubpassContents::eInline);
         context.last_draw_was_framebuffer_fetch = uses_interlock;
     }
-    if ((context.state.features.direct_fragcolor || masked_fetch) && uses_framebuffer_fetch)
+    // nothing can observe the color when the previous draws did not write any
+    if (uses_framebuffer_fetch && (masked_fetch || (context.state.features.direct_fragcolor && !context.record.skip_color_output)))
         framebuffer_fetch_barrier(context);
 
     if (!maskupdate && context.current_visibility_buffer != nullptr && context.current_query_idx != -1 && !context.is_in_query) {
