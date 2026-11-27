@@ -230,6 +230,8 @@ bool create(std::unique_ptr<State> &state, const Config &config) {
     } else if (gl_state.features.support_texture_barrier) {
         LOG_INFO("Your GPU only supports texture barrier, performance may not be good on programmable blending games.");
         LOG_WARN("Consider upgrading to a GPU that has shader interlock.");
+        if (config.current_config.high_accuracy)
+            LOG_INFO("High accuracy: programmable blending is drawn one primitive at a time");
     } else {
         LOG_INFO("Your GPU doesn't support extensions that make programmable blending possible. Some games may have broken graphics.");
         LOG_WARN("Consider updating your graphics drivers or upgrading your GPU.");
@@ -245,6 +247,18 @@ bool create(std::unique_ptr<State> &state, const Config &config) {
     if (config.current_config.disable_mask_bit)
         LOG_WARN("Mask bit emulation is disabled by the settings");
 #endif
+
+    // The mask sampler of SPIR-V shaders needs its own unit, and a place among the samplers of the
+    // fragment stage next to the ones of the guest
+    GLint max_combined_units = 0;
+    GLint max_fragment_units = 0;
+    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_combined_units);
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_fragment_units);
+    gl_state.support_mask_sampler = max_combined_units > shader::MASK_TEXTURE_SLOT_SAMPLER && max_fragment_units > SCE_GXM_MAX_TEXTURE_UNITS;
+    if (gl_state.features.use_mask_bit && gl_state.features.spirv_shader && !gl_state.support_mask_sampler) {
+        LOG_WARN("SPIR-V shaders are not used: the context has no texture unit left for the mask");
+        gl_state.features.spirv_shader = false;
+    }
 
     return gl_state.init();
 }
@@ -391,6 +405,7 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const 
     const bool macroblock_sync = context.render_target && context.render_target->has_macroblock_sync;
     state.surface_cache.begin_scene(macroblock_sync ? Ptr<void>() : context.record.color_surface.data);
     context.self_sampling_indices.clear();
+    context.self_sampling_mipmap_units = 0;
 
     glBindFramebuffer(GL_FRAMEBUFFER, context.current_framebuffer);
 
@@ -850,7 +865,7 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
 
     if (fb_h > 0.0f) {
         const float window_aspect = fb_w / fb_h;
-        constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
+        const float vita_aspect = display_aspect_ratio(display_frame.image_size.x, display_frame.image_size.y);
         const bool pixel_perfect = fullscreen_hd_res_pixel_perfect && fullscreen
             && !(static_cast<int>(fb_w) % DEFAULT_RES_WIDTH)
             && !(static_cast<int>(fb_h) % (DEFAULT_RES_HEIGHT - 4));
@@ -872,12 +887,16 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
     }
 
     // store viewport for touch
-    display.viewport_drawable_w = static_cast<int>(fb_w);
-    display.viewport_drawable_h = static_cast<int>(fb_h);
-    display.viewport_x = vp_pos.x;
-    display.viewport_y = vp_pos.y;
-    display.viewport_w = vp_size.x;
-    display.viewport_h = vp_size.y;
+    {
+        std::lock_guard<std::mutex> guard(display.display_info_mutex);
+        display.viewport_drawable_w = static_cast<int>(fb_w);
+        display.viewport_drawable_h = static_cast<int>(fb_h);
+        display.viewport_x = vp_pos.x;
+        display.viewport_y = vp_pos.y;
+        display.viewport_w = vp_size.x;
+        display.viewport_h = vp_size.y;
+        display.viewport_frame_size = display_frame.image_size;
+    }
 
     if (display_frame.base) {
         // Check if the surface exists
